@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import multiprocessing
+import queue
 import sys
 import time
 import traceback
@@ -114,11 +115,6 @@ def _unpack_request(message: Any, request: T) -> T:
     return request
 
 
-async def _cancel_task(task: asyncio.Task) -> None:
-    task.cancel()
-    await asyncio.sleep(600)
-
-
 async def _run_test(
     mode: Literal["sync", "async"], test_request: ClientCompatRequest
 ) -> ClientCompatResponse:
@@ -142,6 +138,7 @@ async def _run_test(
     with ResponseMetadata() as meta:
         try:
             task: asyncio.Task
+            request_closed = asyncio.Event()
             transport_kwargs: dict = {
                 "enable_gzip": True,
                 "enable_brotli": True,
@@ -179,38 +176,72 @@ async def _run_test(
                     ):
                         match test_request.method:
                             case "BidiStream":
+                                request_queue = queue.Queue()
 
                                 def send_bidi_stream_request_sync(
                                     client: ConformanceServiceClientSync,
                                     request: Iterator[BidiStreamRequest],
                                 ) -> None:
-                                    for message in client.bidi_stream(
+                                    responses = client.bidi_stream(
                                         request,
                                         headers=request_headers,
                                         timeout_ms=timeout_ms,
+                                    )
+                                    for message in test_request.request_messages:
+                                        if test_request.request_delay_ms:
+                                            time.sleep(
+                                                test_request.request_delay_ms / 1000.0
+                                            )
+                                        request_queue.put(
+                                            _unpack_request(
+                                                message, BidiStreamRequest()
+                                            )
+                                        )
+
+                                        if (
+                                            test_request.stream_type
+                                            != StreamType.STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM
+                                        ):
+                                            continue
+
+                                        response = next(responses, None)
+                                        if response is not None:
+                                            payloads.append(response.payload)
+                                            if (
+                                                num
+                                                := test_request.cancel.after_num_responses
+                                            ) and len(payloads) >= num:
+                                                task.cancel()
+
+                                    if test_request.cancel.HasField(
+                                        "before_close_send"
                                     ):
-                                        payloads.append(message.payload)
+                                        task.cancel()
+
+                                    request_queue.put(None)
+
+                                    request_closed.set()
+
+                                    for response in responses:
+                                        payloads.append(response.payload)
                                         if (
                                             num
                                             := test_request.cancel.after_num_responses
                                         ) and len(payloads) >= num:
                                             task.cancel()
 
-                                def bidi_request_stream_sync():
-                                    for message in test_request.request_messages:
-                                        if test_request.request_delay_ms:
-                                            time.sleep(
-                                                test_request.request_delay_ms / 1000.0
-                                            )
-                                        yield _unpack_request(
-                                            message, BidiStreamRequest()
-                                        )
+                                def bidi_stream_request_sync():
+                                    while True:
+                                        request = request_queue.get()
+                                        if request is None:
+                                            return
+                                        yield request
 
                                 task = asyncio.create_task(
                                     asyncio.to_thread(
                                         send_bidi_stream_request_sync,
                                         client,
-                                        bidi_request_stream_sync(),
+                                        bidi_stream_request_sync(),
                                     )
                                 )
 
@@ -236,6 +267,11 @@ async def _run_test(
                                         yield _unpack_request(
                                             message, ClientStreamRequest()
                                         )
+                                    if test_request.cancel.HasField(
+                                        "before_close_send"
+                                    ):
+                                        task.cancel()
+                                    request_closed.set()
 
                                 task = asyncio.create_task(
                                     asyncio.to_thread(
@@ -268,6 +304,7 @@ async def _run_test(
                                         ),
                                     )
                                 )
+                                request_closed.set()
                             case "ServerStream":
 
                                 def send_server_stream_request_sync(
@@ -296,6 +333,7 @@ async def _run_test(
                                         ),
                                     )
                                 )
+                                request_closed.set()
                             case "Unary":
 
                                 def send_unary_request_sync(
@@ -319,6 +357,7 @@ async def _run_test(
                                         ),
                                     )
                                 )
+                                request_closed.set()
                             case "Unimplemented":
                                 task = asyncio.create_task(
                                     asyncio.to_thread(
@@ -331,6 +370,7 @@ async def _run_test(
                                         timeout_ms=timeout_ms,
                                     )
                                 )
+                                request_closed.set()
                             case _:
                                 msg = f"Unrecognized method: {test_request.method}"
                                 raise ValueError(msg)
@@ -370,7 +410,6 @@ async def _run_test(
                                         headers=request_headers,
                                         timeout_ms=timeout_ms,
                                     )
-                                    responses_iter = aiter(responses)
                                     for message in test_request.request_messages:
                                         if test_request.request_delay_ms:
                                             await asyncio.sleep(
@@ -388,35 +427,37 @@ async def _run_test(
                                         ):
                                             continue
 
-                                        response = await anext(responses_iter)
-                                        payloads.append(response.payload)
-                                        if (
-                                            num
-                                            := test_request.cancel.after_num_responses
-                                        ) and len(payloads) >= num:
-                                            await _cancel_task(task)
+                                        response = await anext(responses, None)
+                                        if response is not None:
+                                            payloads.append(response.payload)
+                                            if (
+                                                num
+                                                := test_request.cancel.after_num_responses
+                                            ) and len(payloads) >= num:
+                                                task.cancel()
 
                                     if test_request.cancel.HasField(
                                         "before_close_send"
                                     ):
-                                        await responses.aclose()
-                                        await _cancel_task(task)
+                                        task.cancel()
 
                                     await request_queue.put(None)
 
-                                    async for response in responses_iter:
+                                    request_closed.set()
+
+                                    async for response in responses:
                                         payloads.append(response.payload)
                                         if (
                                             num
                                             := test_request.cancel.after_num_responses
                                         ) and len(payloads) >= num:
-                                            await _cancel_task(task)
+                                            task.cancel()
 
                                 async def bidi_stream_request():
                                     while True:
                                         request = await request_queue.get()
                                         if request is None:
-                                            break
+                                            return
                                         yield request
 
                                 task = asyncio.create_task(
@@ -450,7 +491,8 @@ async def _run_test(
                                     if test_request.cancel.HasField(
                                         "before_close_send"
                                     ):
-                                        await _cancel_task(task)
+                                        task.cancel()
+                                    request_closed.set()
 
                                 task = asyncio.create_task(
                                     send_client_stream_request(
@@ -480,6 +522,7 @@ async def _run_test(
                                         ),
                                     )
                                 )
+                                request_closed.set()
                             case "ServerStream":
 
                                 async def send_server_stream_request(
@@ -507,6 +550,7 @@ async def _run_test(
                                         ),
                                     )
                                 )
+                                request_closed.set()
                             case "Unary":
 
                                 async def send_unary_request(
@@ -529,6 +573,7 @@ async def _run_test(
                                         ),
                                     )
                                 )
+                                request_closed.set()
                             case "Unimplemented":
                                 task = asyncio.create_task(
                                     client.unimplemented(
@@ -540,10 +585,12 @@ async def _run_test(
                                         timeout_ms=timeout_ms,
                                     )
                                 )
+                                request_closed.set()
                             case _:
                                 msg = f"Unrecognized method: {test_request.method}"
                                 raise ValueError(msg)
                         if test_request.cancel.after_close_send_ms:
+                            await request_closed.wait()
                             await asyncio.sleep(
                                 test_request.cancel.after_close_send_ms / 1000.0
                             )

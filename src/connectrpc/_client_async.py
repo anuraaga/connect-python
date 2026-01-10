@@ -373,39 +373,41 @@ class ConnectClient:
                 request, self._codec, self._send_compression
             )
 
-            async with (
-                asyncio_timeout(timeout_s),
-                self._session.stream(
+            async with asyncio_timeout(timeout_s):
+                httpx_req = self._session.build_request(
                     method="POST",
                     url=url,
                     headers=request_headers,
                     content=request_data,
                     timeout=timeout,
-                ) as resp,
-            ):
-                handle_response_headers(resp.headers)
-                if resp.status_code == 200:
-                    self._protocol.validate_stream_response(
-                        self._codec.name(), resp.headers.get("content-type", "")
-                    )
-                    compression = self._protocol.handle_response_compression(
-                        resp.headers, stream=True
-                    )
-                    reader = self._protocol.create_envelope_reader(
-                        ctx.method().output,
-                        self._codec,
-                        compression,
-                        self._read_max_bytes,
-                    )
-                    async for chunk in resp.aiter_bytes():
-                        for message in reader.feed(chunk):
-                            yield message
-                            # Check for cancellation each message. While this seems heavyweight,
-                            # conformance tests require it.
-                            await sleep(0)
-                    reader.handle_response_complete(resp)
-                else:
-                    raise ConnectWireError.from_response(resp).to_exception()
+                )
+                resp = await self._session.send(httpx_req, stream=True)
+                try:
+                    handle_response_headers(resp.headers)
+                    if resp.status_code == 200:
+                        self._protocol.validate_stream_response(
+                            self._codec.name(), resp.headers.get("content-type", "")
+                        )
+                        compression = self._protocol.handle_response_compression(
+                            resp.headers, stream=True
+                        )
+                        reader = self._protocol.create_envelope_reader(
+                            ctx.method().output,
+                            self._codec,
+                            compression,
+                            self._read_max_bytes,
+                        )
+                        async for chunk in resp.aiter_bytes():
+                            for message in reader.feed(chunk):
+                                yield message
+                                # Check for cancellation each message. While this seems heavyweight,
+                                # conformance tests require it.
+                                await sleep(0)
+                        reader.handle_response_complete(resp)
+                    else:
+                        raise ConnectWireError.from_response(resp).to_exception()
+                finally:
+                    await asyncio.shield(resp.aclose())
         except (httpx.TimeoutException, TimeoutError, asyncio.TimeoutError) as e:
             raise ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out") from e
         except ConnectError:

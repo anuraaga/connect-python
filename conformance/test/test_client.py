@@ -47,12 +47,7 @@ def test_client_sync() -> None:
         pytest.fail(f"\n{result.stdout}\n{result.stderr}")
 
 
-_skipped_tests_async = [
-    *_skipped_tests,
-    # Cancellation currently not working for full duplex
-    "--skip",
-    "Client Cancellation/**/full-duplex/**",
-]
+_skipped_tests_async = [*_skipped_tests]
 
 
 def test_client_async() -> None:
@@ -69,8 +64,6 @@ def test_client_async() -> None:
             "--mode",
             "client",
             *_skipped_tests_async,
-            "--run",
-            "**/cancel-before-close-send",
             "--",
             *args,
         ],
