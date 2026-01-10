@@ -12,19 +12,7 @@ _current_dir = Path(__file__).parent
 _client_py_path = str(_current_dir / "client.py")
 _config_path = str(_current_dir / "config.yaml")
 
-_skipped_tests = [
-    # Not implemented yet,
-    "--skip",
-    "**/Protocol:PROTOCOL_GRPC/**",
-    "--skip",
-    "gRPC Trailers/**",
-    "--skip",
-    "gRPC Unexpected Responses/**",
-    "--skip",
-    "gRPC Empty Responses/**",
-    "--skip",
-    "gRPC Proto Sub-Format Responses/**",
-]
+_skipped_tests = []
 
 _skipped_tests_sync = [
     *_skipped_tests,

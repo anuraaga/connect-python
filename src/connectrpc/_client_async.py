@@ -11,7 +11,6 @@ from httpx import USE_CLIENT_DEFAULT, Timeout
 from . import _client_shared
 from ._asyncio_timeout import timeout as asyncio_timeout
 from ._codec import Codec, get_proto_binary_codec, get_proto_json_codec
-from ._envelope import EnvelopeReader
 from ._interceptor_async import (
     BidiStreamInterceptor,
     ClientStreamInterceptor,
@@ -21,10 +20,8 @@ from ._interceptor_async import (
     resolve_interceptors,
 )
 from ._protocol import ConnectWireError
-from ._protocol_connect import (
-    CONNECT_STREAMING_HEADER_COMPRESSION,
-    ConnectEnvelopeWriter,
-)
+from ._protocol_connect import ConnectClientProtocol, ConnectEnvelopeWriter
+from ._protocol_grpc import GRPCClientProtocol
 from ._response_metadata import handle_response_headers
 from .code import Code
 from .errors import ConnectError
@@ -91,6 +88,7 @@ class ConnectClient:
         address: str,
         *,
         proto_json: bool = False,
+        grpc: bool = False,
         accept_compression: Iterable[str] | None = None,
         send_compression: str | None = None,
         timeout_ms: int | None = None,
@@ -127,6 +125,11 @@ class ConnectClient:
             )
             self._close_client = True
         self._closed = False
+
+        if grpc:
+            self._protocol = GRPCClientProtocol()
+        else:
+            self._protocol = ConnectClientProtocol()
 
         interceptors = resolve_interceptors(interceptors)
         execute_unary = self._send_request_unary
@@ -192,7 +195,7 @@ class ConnectClient:
         timeout_ms: int | None = None,
         use_get: bool = False,
     ) -> RES:
-        ctx = _client_shared.create_request_context(
+        ctx = self._protocol.create_request_context(
             method=method,
             http_method="GET" if use_get else "POST",
             user_headers=headers,
@@ -212,7 +215,7 @@ class ConnectClient:
         headers: Headers | Mapping[str, str] | None = None,
         timeout_ms: int | None = None,
     ) -> RES:
-        ctx = _client_shared.create_request_context(
+        ctx = self._protocol.create_request_context(
             method=method,
             http_method="POST",
             user_headers=headers,
@@ -232,7 +235,7 @@ class ConnectClient:
         headers: Headers | Mapping[str, str] | None = None,
         timeout_ms: int | None = None,
     ) -> AsyncIterator[RES]:
-        ctx = _client_shared.create_request_context(
+        ctx = self._protocol.create_request_context(
             method=method,
             http_method="POST",
             user_headers=headers,
@@ -252,7 +255,7 @@ class ConnectClient:
         headers: Headers | Mapping[str, str] | None = None,
         timeout_ms: int | None = None,
     ) -> AsyncIterator[RES]:
-        ctx = _client_shared.create_request_context(
+        ctx = self._protocol.create_request_context(
             method=method,
             http_method="POST",
             user_headers=headers,
@@ -267,6 +270,11 @@ class ConnectClient:
     async def _send_request_unary(
         self, request: REQ, ctx: RequestContext[REQ, RES]
     ) -> RES:
+        if isinstance(self._protocol, GRPCClientProtocol):
+            return await _consume_single_response(
+                self._send_request_bidi_stream(_yield_single_message(request), ctx)
+            )
+
         request_headers = httpx.Headers(list(ctx.request_headers().allitems()))
         url = f"{self._address}/{ctx.method().service_name}/{ctx.method().name}"
         if (timeout_ms := ctx.timeout_ms()) is not None:
@@ -303,14 +311,14 @@ class ConnectClient:
                     timeout_s,
                 )
 
-            _client_shared.validate_response_content_encoding(
-                resp.headers.get("content-encoding", "")
-            )
-            _client_shared.validate_response_content_type(
+            self._protocol.validate_response(
                 self._codec.name(),
                 resp.status_code,
                 resp.headers.get("content-type", ""),
             )
+            # Decompression itself is handled by httpx, but we validate it
+            # by resolving it.
+            self._protocol.handle_response_compression(resp.headers, stream=False)
             handle_response_headers(resp.headers)
 
             if resp.status_code == 200:
@@ -375,16 +383,15 @@ class ConnectClient:
                     timeout=timeout,
                 ) as resp,
             ):
-                compression = _client_shared.validate_response_content_encoding(
-                    resp.headers.get(CONNECT_STREAMING_HEADER_COMPRESSION, "")
-                )
-                _client_shared.validate_stream_response_content_type(
-                    self._codec.name(), resp.headers.get("content-type", "")
-                )
                 handle_response_headers(resp.headers)
-
                 if resp.status_code == 200:
-                    reader = EnvelopeReader(
+                    self._protocol.validate_stream_response(
+                        self._codec.name(), resp.headers.get("content-type", "")
+                    )
+                    compression = self._protocol.handle_response_compression(
+                        resp.headers, stream=True
+                    )
+                    reader = self._protocol.create_envelope_reader(
                         ctx.method().output,
                         self._codec,
                         compression,
@@ -396,6 +403,7 @@ class ConnectClient:
                             # Check for cancellation each message. While this seems heavyweight,
                             # conformance tests require it.
                             await sleep(0)
+                    reader.handle_response_complete(resp)
                 else:
                     raise ConnectWireError.from_response(resp).to_exception()
         except (httpx.TimeoutException, TimeoutError, asyncio.TimeoutError) as e:

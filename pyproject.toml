@@ -9,7 +9,11 @@ maintainers = [
     { name = "Yasushi Itoh", email = "i2y.may.roku@gmail.com" },
 ]
 requires-python = ">= 3.10"
-dependencies = ["httpx>=0.28.1", "protobuf>=5.28"]
+dependencies = [
+    "httpx>=0.28.1",
+    "protobuf>=5.28",
+    "pyqwest",
+]
 readme = "README.md"
 license-files = ["LICENSE"]
 keywords = ["rpc", "grpc", "connect", "protobuf", "http"]
@@ -246,6 +250,7 @@ members = ["example", "noextras"]
 [tool.uv.sources]
 connect-python = { workspace = true }
 connect-python-example = { workspace = true }
+pyqwest = { path = "../pyqwest" }
 
 [tool.bumpversion]
 current_version = "0.7.0"

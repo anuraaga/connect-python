@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from base64 import b64decode, b64encode
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
 
     from ._codec import Codec
     from ._compression import Compression
-    from ._envelope import EnvelopeWriter
+    from ._envelope import EnvelopeReader, EnvelopeWriter
     from .method import MethodInfo
     from .request import Headers, RequestContext
 
@@ -211,6 +212,51 @@ class ServerProtocol(Protocol):
         self, headers: Headers
     ) -> tuple[Compression | None, Compression]:
         """Negotiates request and response compression based on headers."""
+        ...
+
+
+class ClientProtocol(Protocol):
+    def create_request_context(
+        self,
+        *,
+        method: MethodInfo[REQ, RES],
+        http_method: str,
+        user_headers: Headers | Mapping[str, str] | None,
+        timeout_ms: int | None,
+        codec: Codec,
+        stream: bool,
+        accept_compression: Iterable[str] | None,
+        send_compression: Compression | None,
+    ) -> RequestContext[REQ, RES]:
+        """Creates a RequestContext for the given method and headers."""
+        ...
+
+    def validate_response(
+        self, request_codec_name: str, status_code: int, response_content_type: str
+    ) -> None:
+        """Validates a unary response"""
+        ...
+
+    def validate_stream_response(
+        self, request_codec_name: str, response_content_type: str
+    ) -> None:
+        """Validates a streaming response"""
+        ...
+
+    def handle_response_compression(
+        self, headers: httpx.Headers, *, stream: bool
+    ) -> Compression:
+        """Handles response compression based on the response headers."""
+        ...
+
+    def create_envelope_reader(
+        self,
+        message_class: type[RES],
+        codec: Codec,
+        compression: Compression,
+        read_max_bytes: int | None,
+    ) -> EnvelopeReader[RES]:
+        """Creates the EnvelopeReader to read response messages."""
         ...
 
 

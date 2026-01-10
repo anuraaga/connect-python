@@ -448,6 +448,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "protobuf" },
+    { name = "pyqwest" },
 ]
 
 [package.dev-dependencies]
@@ -483,6 +484,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "protobuf", specifier = ">=5.28" },
+    { name = "pyqwest", directory = "../pyqwest" },
 ]
 
 [package.metadata.requires-dev]
@@ -1853,6 +1855,36 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/80/be/97b83a464498a79103036bc74d1038df4a7ef0e402cfaf4d5e113fb14759/pyopenssl-25.3.0.tar.gz", hash = "sha256:c981cb0a3fd84e8602d7afc209522773b94c1c2446a3c710a75b06fe1beae329", size = 184073, upload-time = "2025-09-17T00:32:21.037Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/81/ef2b1dfd1862567d573a4fdbc9f969067621764fbb74338496840a1d2977/pyopenssl-25.3.0-py3-none-any.whl", hash = "sha256:1fda6fc034d5e3d179d39e59c1895c9faeaf40a79de5fc4cbbfbe0d36f4a77b6", size = 57268, upload-time = "2025-09-17T00:32:19.474Z" },
+]
+
+[[package]]
+name = "pyqwest"
+version = "0.0.1"
+source = { directory = "../pyqwest" }
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "aiohttp", extras = ["speedups"] },
+    { name = "asgiref" },
+    { name = "httpx", extras = ["http2"] },
+    { name = "maturin" },
+    { name = "niquests", extras = ["http3"] },
+    { name = "poethepoet" },
+    { name = "psutil" },
+    { name = "pyright", extras = ["nodejs"] },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-benchmark" },
+    { name = "pytest-cov" },
+    { name = "pyvoy" },
+    { name = "ruff" },
+    { name = "trustme" },
+]
+docs = [
+    { name = "mkdocstrings-python" },
+    { name = "zensical" },
 ]
 
 [[package]]

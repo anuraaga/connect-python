@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import ssl
 import sys
 import time
 import traceback
-from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Literal, TypeVar
 
 import httpx
@@ -16,7 +14,12 @@ from gen.connectrpc.conformance.v1.client_compat_pb2 import (
     ClientCompatResponse,
 )
 from gen.connectrpc.conformance.v1.config_pb2 import Code as ConformanceCode
-from gen.connectrpc.conformance.v1.config_pb2 import Codec, Compression, HTTPVersion
+from gen.connectrpc.conformance.v1.config_pb2 import (
+    Codec,
+    Compression,
+    HTTPVersion,
+    Protocol,
+)
 from gen.connectrpc.conformance.v1.service_connect import (
     ConformanceServiceClient,
     ConformanceServiceClientSync,
@@ -31,6 +34,9 @@ from gen.connectrpc.conformance.v1.service_pb2 import (
     UnimplementedRequest,
 )
 from google.protobuf.message import Message
+from pyqwest import HTTPTransport, SyncHTTPTransport
+from pyqwest import HTTPVersion as PyQwestHTTPVersion
+from pyqwest.httpx import AsyncPyQwestTransport, PyQwestTransport
 
 from connectrpc.client import ResponseMetadata
 from connectrpc.code import Code
@@ -129,38 +135,30 @@ async def _run_test(
     with ResponseMetadata() as meta:
         try:
             task: asyncio.Task
-            session_kwargs = {}
+            transport_kwargs: dict = {
+                "enable_gzip": True,
+                "enable_brotli": True,
+                "enable_zstd": True,
+            }
             match test_request.http_version:
                 case HTTPVersion.HTTP_VERSION_1:
-                    session_kwargs["http1"] = True
-                    session_kwargs["http2"] = False
+                    transport_kwargs["http_version"] = PyQwestHTTPVersion.HTTP1
                 case HTTPVersion.HTTP_VERSION_2:
-                    session_kwargs["http1"] = False
-                    session_kwargs["http2"] = True
+                    transport_kwargs["http_version"] = PyQwestHTTPVersion.HTTP2
             scheme = "http"
             if test_request.server_tls_cert:
                 scheme = "https"
-                ctx = ssl.create_default_context(
-                    purpose=ssl.Purpose.SERVER_AUTH,
-                    cadata=test_request.server_tls_cert.decode(),
-                )
+                transport_kwargs["tls_ca_cert"] = test_request.server_tls_cert
                 if test_request.HasField("client_tls_creds"):
-                    with (
-                        NamedTemporaryFile() as cert_file,
-                        NamedTemporaryFile() as key_file,
-                    ):
-                        cert_file.write(test_request.client_tls_creds.cert)
-                        cert_file.flush()
-                        key_file.write(test_request.client_tls_creds.key)
-                        key_file.flush()
-                        ctx.load_cert_chain(
-                            certfile=cert_file.name, keyfile=key_file.name
-                        )
-                session_kwargs["verify"] = ctx
+                    transport_kwargs["tls_key"] = test_request.client_tls_creds.key
+                    transport_kwargs["tls_cert"] = test_request.client_tls_creds.cert
             match mode:
                 case "sync":
                     with (
-                        httpx.Client(**session_kwargs) as session,
+                        PyQwestTransport(
+                            SyncHTTPTransport(**transport_kwargs)
+                        ) as transport,
+                        httpx.Client(transport=transport) as session,
                         ConformanceServiceClientSync(
                             f"{scheme}://{test_request.host}:{test_request.port}",
                             session=session,
@@ -168,6 +166,7 @@ async def _run_test(
                                 test_request.compression
                             ),
                             proto_json=test_request.codec == Codec.CODEC_JSON,
+                            grpc=test_request.protocol == Protocol.PROTOCOL_GRPC,
                             read_max_bytes=read_max_bytes,
                         ) as client,
                     ):
@@ -336,7 +335,10 @@ async def _run_test(
                         await task
                 case "async":
                     async with (
-                        httpx.AsyncClient(**session_kwargs) as session,
+                        AsyncPyQwestTransport(
+                            HTTPTransport(**transport_kwargs)
+                        ) as transport,
+                        httpx.AsyncClient(transport=transport) as session,
                         ConformanceServiceClient(
                             f"{scheme}://{test_request.host}:{test_request.port}",
                             session=session,
@@ -344,6 +346,7 @@ async def _run_test(
                                 test_request.compression
                             ),
                             proto_json=test_request.codec == Codec.CODEC_JSON,
+                            grpc=test_request.protocol == Protocol.PROTOCOL_GRPC,
                             read_max_bytes=read_max_bytes,
                         ) as client,
                     ):
