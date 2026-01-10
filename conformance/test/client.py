@@ -20,6 +20,7 @@ from gen.connectrpc.conformance.v1.config_pb2 import (
     Compression,
     HTTPVersion,
     Protocol,
+    StreamType,
 )
 from gen.connectrpc.conformance.v1.service_connect import (
     ConformanceServiceClient,
@@ -111,6 +112,11 @@ T = TypeVar("T", bound=Message)
 def _unpack_request(message: Any, request: T) -> T:
     message.Unpack(request)
     return request
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    task.cancel()
+    await asyncio.sleep(600)
 
 
 async def _run_test(
@@ -353,6 +359,7 @@ async def _run_test(
                     ):
                         match test_request.method:
                             case "BidiStream":
+                                request_queue = asyncio.Queue()
 
                                 async def send_bidi_stream_request(
                                     client: ConformanceServiceClient,
@@ -363,31 +370,54 @@ async def _run_test(
                                         headers=request_headers,
                                         timeout_ms=timeout_ms,
                                     )
-                                    async for response in responses:
-                                        payloads.append(response.payload)
-                                        if (
-                                            num
-                                            := test_request.cancel.after_num_responses
-                                        ) and len(payloads) >= num:
-                                            task.cancel()
-
-                                async def bidi_stream_request():
+                                    responses_iter = aiter(responses)
                                     for message in test_request.request_messages:
                                         if test_request.request_delay_ms:
                                             await asyncio.sleep(
                                                 test_request.request_delay_ms / 1000.0
                                             )
-                                        yield _unpack_request(
-                                            message, BidiStreamRequest()
+                                        await request_queue.put(
+                                            _unpack_request(
+                                                message, BidiStreamRequest()
+                                            )
                                         )
+
+                                        if (
+                                            test_request.stream_type
+                                            != StreamType.STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM
+                                        ):
+                                            continue
+
+                                        response = await anext(responses_iter)
+                                        payloads.append(response.payload)
+                                        if (
+                                            num
+                                            := test_request.cancel.after_num_responses
+                                        ) and len(payloads) >= num:
+                                            await _cancel_task(task)
+
                                     if test_request.cancel.HasField(
                                         "before_close_send"
                                     ):
-                                        task.cancel()
-                                        # Don't finish the stream for this case by sleeping for
-                                        # a long time. We won't end up sleeping for long since we
-                                        # cancelled.
-                                        await asyncio.sleep(600)
+                                        await responses.aclose()
+                                        await _cancel_task(task)
+
+                                    await request_queue.put(None)
+
+                                    async for response in responses_iter:
+                                        payloads.append(response.payload)
+                                        if (
+                                            num
+                                            := test_request.cancel.after_num_responses
+                                        ) and len(payloads) >= num:
+                                            await _cancel_task(task)
+
+                                async def bidi_stream_request():
+                                    while True:
+                                        request = await request_queue.get()
+                                        if request is None:
+                                            break
+                                        yield request
 
                                 task = asyncio.create_task(
                                     send_bidi_stream_request(
@@ -420,11 +450,7 @@ async def _run_test(
                                     if test_request.cancel.HasField(
                                         "before_close_send"
                                     ):
-                                        task.cancel()
-                                        # Don't finish the stream for this case by sleeping for
-                                        # a long time. We won't end up sleeping for long since we
-                                        # cancelled.
-                                        await asyncio.sleep(600)
+                                        await _cancel_task(task)
 
                                 task = asyncio.create_task(
                                     send_client_stream_request(

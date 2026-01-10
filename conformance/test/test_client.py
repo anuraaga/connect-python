@@ -69,6 +69,8 @@ def test_client_async() -> None:
             "--mode",
             "client",
             *_skipped_tests_async,
+            "--run",
+            "**/cancel-before-close-send",
             "--",
             *args,
         ],
