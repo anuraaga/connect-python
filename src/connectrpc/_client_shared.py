@@ -136,7 +136,9 @@ _stream_error_code_regex = re.compile(
 
 
 # https://github.com/connectrpc/connect-go/blob/59cc6973156cd9164d6bea493b1d106ed894f2df/error.go#L393
-def maybe_map_stream_reset(e: Exception, ctx: RequestContext[REQ, RES]) -> None:
+def maybe_map_stream_reset(
+    e: Exception, ctx: RequestContext[REQ, RES]
+) -> ConnectError | None:
     if not isinstance(e, RemoteProtocolError):
         return None
 

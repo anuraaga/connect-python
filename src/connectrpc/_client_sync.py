@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from ._compression import Compression
+    from ._envelope import EnvelopeReader
     from .method import MethodInfo
     from .request import Headers, RequestContext
 
@@ -348,6 +349,8 @@ class ConnectClientSync:
             timeout = USE_CLIENT_DEFAULT
 
         stream_error: Exception | None = None
+        reader: EnvelopeReader | None = None
+        resp: httpx.Response | None = None
         try:
             request_data = _streaming_request_content(
                 request, self._codec, self._send_compression
@@ -404,7 +407,10 @@ class ConnectClientSync:
                 raise stream_error from None
 
             if rst_err := _client_shared.maybe_map_stream_reset(e, ctx):
-                reader.handle_response_complete(resp, rst_err)
+                # It is possible for a reset to come with trailers which should
+                # be used.
+                if reader and resp:
+                    reader.handle_response_complete(resp, rst_err)
                 raise rst_err from e
             raise ConnectError(Code.UNAVAILABLE, str(e)) from e
 
