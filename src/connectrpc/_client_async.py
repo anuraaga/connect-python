@@ -415,6 +415,9 @@ class ConnectClient:
         except CancelledError as e:
             raise ConnectError(Code.CANCELED, "Request was cancelled") from e
         except Exception as e:
+            if rst_err := _client_shared.maybe_map_stream_reset(e, ctx):
+                reader.handle_response_complete(resp, rst_err)
+                raise rst_err from e
             raise ConnectError(Code.UNAVAILABLE, str(e)) from e
 
 

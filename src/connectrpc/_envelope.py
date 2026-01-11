@@ -4,17 +4,17 @@ import struct
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-import httpx
-
 from ._compression import Compression, IdentityCompression
-from ._protocol import ConnectWireError
 from .code import Code
 from .errors import ConnectError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    import httpx
+
     from ._codec import Codec
+    from ._protocol import ConnectWireError
     from .request import Headers
 
 _RES = TypeVar("_RES")
@@ -92,7 +92,9 @@ class EnvelopeReader(Generic[_RES]):
         """
         return False
 
-    def handle_response_complete(self, response: httpx.Response) -> None:
+    def handle_response_complete(
+        self, response: httpx.Response, e: ConnectError | None = None
+    ) -> None:
         """Handle any client finalization needed when the response is complete.
         This is typically used to process trailers for gRPC.
         """

@@ -3,11 +3,8 @@ from __future__ import annotations
 import sys
 import urllib.parse
 from base64 import b64decode, b64encode
-from collections.abc import Iterable, Mapping
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, TypeVar
-
-import httpx
 
 from ._compression import (
     IdentityCompression,
@@ -26,6 +23,10 @@ from .errors import ConnectError
 from .request import Headers, RequestContext
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    import httpx
+
     from ._codec import Codec
     from ._compression import Compression
     from .method import MethodInfo
@@ -263,7 +264,9 @@ class GRPCEnvelopeReader(EnvelopeReader[RES]):
         self._read_message = True
         return False
 
-    def handle_response_complete(self, response: httpx.Response) -> None:
+    def handle_response_complete(
+        self, response: httpx.Response, e: ConnectError | None = None
+    ) -> None:
         get_trailers = response.extensions.get("get_trailers")
         if not get_trailers:
             msg = "gRPC client support requires using an HTTPX-compatible client that supports trailers"
@@ -278,23 +281,28 @@ class GRPCEnvelopeReader(EnvelopeReader[RES]):
         if grpc_status is None:
             # If there was a body message, we do not read response headers
             if self._read_message:
-                raise ConnectError(Code.INTERNAL, "missing grpc-status trailer")
+                raise e or ConnectError(Code.INTERNAL, "missing grpc-status trailer")
             trailers = response.headers
 
         grpc_status = trailers.get("grpc-status")
         if grpc_status is None:
-            raise ConnectError(Code.INTERNAL, "missing grpc-status trailer")
+            raise e or ConnectError(Code.INTERNAL, "missing grpc-status trailer")
 
+        # e is present for RST_STREAM. We prioritize its code while reading message and details
+        # from trailers when available.
+        code = e.code if e else None
         if grpc_status != "0":
             message = trailers.get("grpc-message", "")
             if grpc_status_details := trailers.get("grpc-status-details-bin"):
                 status = Status()
                 status.ParseFromString(b64decode(grpc_status_details + "==="))
-                connect_code = _grpc_status_to_connect.get(
+                connect_code = code or _grpc_status_to_connect.get(
                     str(status.code), Code.UNKNOWN
                 )
                 raise ConnectError(connect_code, status.message, details=status.details)
-            connect_code = _grpc_status_to_connect.get(grpc_status, Code.UNKNOWN)
+            connect_code = code or _grpc_status_to_connect.get(
+                grpc_status, Code.UNKNOWN
+            )
             raise ConnectError(connect_code, urllib.parse.unquote(message))
 
 

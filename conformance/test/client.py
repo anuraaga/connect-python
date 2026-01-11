@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import multiprocessing
 import queue
+import ssl
 import sys
 import time
 import traceback
-from typing import TYPE_CHECKING, Literal, TypeVar
+from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING, Literal, TypeVar, get_args
 
 import httpx
 from _util import create_standard_streams
@@ -39,7 +42,7 @@ from gen.connectrpc.conformance.v1.service_pb2 import (
 from google.protobuf.message import Message
 from pyqwest import HTTPTransport, SyncHTTPTransport
 from pyqwest import HTTPVersion as PyQwestHTTPVersion
-from pyqwest.httpx import AsyncPyQwestTransport, PyQwestTransport
+from pyqwest.httpx import AsyncPyqwestTransport, PyqwestTransport
 
 from connectrpc.client import ResponseMetadata
 from connectrpc.code import Code
@@ -115,8 +118,127 @@ def _unpack_request(message: Any, request: T) -> T:
     return request
 
 
+async def httpx_client_kwargs(test_request: ClientCompatRequest) -> dict:
+    kwargs = {}
+    match test_request.http_version:
+        case HTTPVersion.HTTP_VERSION_1:
+            kwargs["http1"] = True
+            kwargs["http2"] = False
+        case HTTPVersion.HTTP_VERSION_2:
+            kwargs["http1"] = False
+            kwargs["http2"] = True
+    if test_request.server_tls_cert:
+        ctx = ssl.create_default_context(
+            purpose=ssl.Purpose.SERVER_AUTH,
+            cadata=test_request.server_tls_cert.decode(),
+        )
+        if test_request.HasField("client_tls_creds"):
+
+            def load_certs() -> None:
+                with (
+                    NamedTemporaryFile() as cert_file,
+                    NamedTemporaryFile() as key_file,
+                ):
+                    cert_file.write(test_request.client_tls_creds.cert)
+                    cert_file.flush()
+                    key_file.write(test_request.client_tls_creds.key)
+                    key_file.flush()
+                    ctx.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
+
+            await asyncio.to_thread(load_certs)
+        kwargs["verify"] = ctx
+
+    return kwargs
+
+
+def pyqwest_client_kwargs(test_request: ClientCompatRequest) -> dict:
+    kwargs: dict = {"enable_gzip": True, "enable_brotli": True, "enable_zstd": True}
+    match test_request.http_version:
+        case HTTPVersion.HTTP_VERSION_1:
+            kwargs["http_version"] = PyQwestHTTPVersion.HTTP1
+        case HTTPVersion.HTTP_VERSION_2:
+            kwargs["http_version"] = PyQwestHTTPVersion.HTTP2
+    if test_request.server_tls_cert:
+        kwargs["tls_ca_cert"] = test_request.server_tls_cert
+        if test_request.HasField("client_tls_creds"):
+            kwargs["tls_key"] = test_request.client_tls_creds.key
+            kwargs["tls_cert"] = test_request.client_tls_creds.cert
+
+    return kwargs
+
+
+@contextlib.asynccontextmanager
+async def client_sync(
+    test_request: ClientCompatRequest, client_type: Client
+) -> AsyncIterator[ConformanceServiceClientSync]:
+    read_max_bytes = None
+    if test_request.message_receive_limit:
+        read_max_bytes = test_request.message_receive_limit
+    scheme = "https" if test_request.server_tls_cert else "http"
+    cleanup = contextlib.ExitStack()
+    match client_type:
+        case "httpx":
+            args = await httpx_client_kwargs(test_request)
+            session = cleanup.enter_context(httpx.Client(**args))
+        case "pyqwest":
+            args = pyqwest_client_kwargs(test_request)
+            http_transport = cleanup.enter_context(SyncHTTPTransport(**args))
+            transport = cleanup.enter_context(PyqwestTransport(http_transport))
+            session = cleanup.enter_context(httpx.Client(transport=transport))
+
+    with (
+        cleanup,
+        ConformanceServiceClientSync(
+            f"{scheme}://{test_request.host}:{test_request.port}",
+            session=session,
+            send_compression=_convert_compression(test_request.compression),
+            proto_json=test_request.codec == Codec.CODEC_JSON,
+            grpc=test_request.protocol == Protocol.PROTOCOL_GRPC,
+            read_max_bytes=read_max_bytes,
+        ) as client,
+    ):
+        yield client
+
+
+@contextlib.asynccontextmanager
+async def client_async(
+    test_request: ClientCompatRequest, client_type: Client
+) -> AsyncIterator[ConformanceServiceClient]:
+    read_max_bytes = None
+    if test_request.message_receive_limit:
+        read_max_bytes = test_request.message_receive_limit
+    scheme = "https" if test_request.server_tls_cert else "http"
+    cleanup = contextlib.AsyncExitStack()
+    match client_type:
+        case "httpx":
+            args = await httpx_client_kwargs(test_request)
+            session = await cleanup.enter_async_context(httpx.AsyncClient(**args))
+        case "pyqwest":
+            args = pyqwest_client_kwargs(test_request)
+            http_transport = await cleanup.enter_async_context(HTTPTransport(**args))
+            transport = await cleanup.enter_async_context(
+                AsyncPyqwestTransport(http_transport)
+            )
+            session = await cleanup.enter_async_context(
+                httpx.AsyncClient(transport=transport)
+            )
+
+    async with (
+        cleanup,
+        ConformanceServiceClient(
+            f"{scheme}://{test_request.host}:{test_request.port}",
+            session=session,
+            send_compression=_convert_compression(test_request.compression),
+            proto_json=test_request.codec == Codec.CODEC_JSON,
+            grpc=test_request.protocol == Protocol.PROTOCOL_GRPC,
+            read_max_bytes=read_max_bytes,
+        ) as client,
+    ):
+        yield client
+
+
 async def _run_test(
-    mode: Literal["sync", "async"], test_request: ClientCompatRequest
+    mode: Mode, test_request: ClientCompatRequest, client_type: Client
 ) -> ClientCompatResponse:
     test_response = ClientCompatResponse()
     test_response.test_name = test_request.test_name
@@ -124,9 +246,6 @@ async def _run_test(
     timeout_ms = None
     if test_request.timeout_ms:
         timeout_ms = test_request.timeout_ms
-    read_max_bytes = None
-    if test_request.message_receive_limit:
-        read_max_bytes = test_request.message_receive_limit
 
     request_headers = Headers()
     for header in test_request.request_headers:
@@ -139,41 +258,9 @@ async def _run_test(
         try:
             task: asyncio.Task
             request_closed = asyncio.Event()
-            transport_kwargs: dict = {
-                "enable_gzip": True,
-                "enable_brotli": True,
-                "enable_zstd": True,
-            }
-            match test_request.http_version:
-                case HTTPVersion.HTTP_VERSION_1:
-                    transport_kwargs["http_version"] = PyQwestHTTPVersion.HTTP1
-                case HTTPVersion.HTTP_VERSION_2:
-                    transport_kwargs["http_version"] = PyQwestHTTPVersion.HTTP2
-            scheme = "http"
-            if test_request.server_tls_cert:
-                scheme = "https"
-                transport_kwargs["tls_ca_cert"] = test_request.server_tls_cert
-                if test_request.HasField("client_tls_creds"):
-                    transport_kwargs["tls_key"] = test_request.client_tls_creds.key
-                    transport_kwargs["tls_cert"] = test_request.client_tls_creds.cert
             match mode:
                 case "sync":
-                    with (
-                        PyQwestTransport(
-                            SyncHTTPTransport(**transport_kwargs)
-                        ) as transport,
-                        httpx.Client(transport=transport) as session,
-                        ConformanceServiceClientSync(
-                            f"{scheme}://{test_request.host}:{test_request.port}",
-                            session=session,
-                            send_compression=_convert_compression(
-                                test_request.compression
-                            ),
-                            proto_json=test_request.codec == Codec.CODEC_JSON,
-                            grpc=test_request.protocol == Protocol.PROTOCOL_GRPC,
-                            read_max_bytes=read_max_bytes,
-                        ) as client,
-                    ):
+                    async with client_sync(test_request, client_type) as client:
                         match test_request.method:
                             case "BidiStream":
                                 request_queue = queue.Queue()
@@ -381,22 +468,7 @@ async def _run_test(
                             task.cancel()
                         await task
                 case "async":
-                    async with (
-                        AsyncPyQwestTransport(
-                            HTTPTransport(**transport_kwargs)
-                        ) as transport,
-                        httpx.AsyncClient(transport=transport) as session,
-                        ConformanceServiceClient(
-                            f"{scheme}://{test_request.host}:{test_request.port}",
-                            session=session,
-                            send_compression=_convert_compression(
-                                test_request.compression
-                            ),
-                            proto_json=test_request.codec == Codec.CODEC_JSON,
-                            grpc=test_request.protocol == Protocol.PROTOCOL_GRPC,
-                            read_max_bytes=read_max_bytes,
-                        ) as client,
-                    ):
+                    async with client_async(test_request, client_type) as client:
                         match test_request.method:
                             case "BidiStream":
                                 request_queue = asyncio.Queue()
@@ -618,20 +690,25 @@ async def _run_test(
     return test_response
 
 
+Mode = Literal["sync", "async"]
+Client = Literal["httpx", "pyqwest"]
+
+
 class Args(argparse.Namespace):
-    mode: Literal["sync", "async"]
+    mode: Mode
+    client: Client
     parallel: int
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Conformance client")
-    parser.add_argument("--mode", choices=["sync", "async"])
+    parser.add_argument("--mode", choices=get_args(Mode))
     parser.add_argument("--parallel", type=int, default=multiprocessing.cpu_count() * 4)
+    parser.add_argument("--client", choices=get_args(Client))
     args = parser.parse_args(namespace=Args())
 
     stdin, stdout = await create_standard_streams()
     sema = asyncio.Semaphore(args.parallel)
-    stdout_lock = asyncio.Lock()
     tasks: list[asyncio.Task] = []
     try:
         while True:
@@ -647,14 +724,12 @@ async def main() -> None:
 
             async def task(request: ClientCompatRequest) -> None:
                 async with sema:
-                    response = await _run_test(args.mode, request)
+                    response = await _run_test(args.mode, request, args.client)
 
                     response_buf = response.SerializeToString()
                     size_buf = len(response_buf).to_bytes(4, byteorder="big")
-                    async with stdout_lock:
-                        stdout.write(size_buf)
-                        stdout.write(response_buf)
-                        await stdout.drain()
+                    stdout.write(size_buf + response_buf)
+                    await stdout.drain()
 
             tasks.append(asyncio.create_task(task(request)))
     finally:

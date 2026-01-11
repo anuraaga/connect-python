@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from base64 import b64decode, b64encode
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
@@ -14,7 +13,7 @@ from .code import Code
 from .errors import ConnectError
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     import httpx
 

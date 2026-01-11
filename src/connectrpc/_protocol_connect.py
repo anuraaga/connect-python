@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import json
 import struct
-from collections.abc import Iterable, Mapping
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, TypeVar
-
-import httpx
 
 from ._codec import CODEC_NAME_JSON, CODEC_NAME_JSON_CHARSET_UTF8, Codec
 from ._compression import (
@@ -26,6 +23,10 @@ from .method import IdempotencyLevel, MethodInfo
 from .request import Headers, RequestContext
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    import httpx
+
     from ._codec import Codec
     from ._compression import Compression
 

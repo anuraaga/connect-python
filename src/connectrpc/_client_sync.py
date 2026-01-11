@@ -381,6 +381,13 @@ class ConnectClientSync:
                     except ConnectError as e:
                         stream_error = e
                         raise
+                    # For sync, we rely on the HTTP client to handle timeout, but
+                    # currently the one we use for gRPC does not propagate RST_STREAM
+                    # correctly which is used for server timeouts. We go ahead and check
+                    # the timeout ourselves too.
+                    # https://github.com/hyperium/hyper/issues/3681#issuecomment-3734084436
+                    if (t := ctx.timeout_ms()) is not None and t <= 0:
+                        raise TimeoutError
                     reader.handle_response_complete(resp)
                 else:
                     raise ConnectWireError.from_response(resp).to_exception()
@@ -395,6 +402,10 @@ class ConnectClientSync:
             # the stream error here.
             if stream_error is not None:
                 raise stream_error from None
+
+            if rst_err := _client_shared.maybe_map_stream_reset(e, ctx):
+                reader.handle_response_complete(resp, rst_err)
+                raise rst_err from e
             raise ConnectError(Code.UNAVAILABLE, str(e)) from e
 
 

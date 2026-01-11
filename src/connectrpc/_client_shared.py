@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import base64
+import re
 from http import HTTPStatus
 from typing import TYPE_CHECKING, TypeVar
+
+from h2.errors import ErrorCodes
+from httpx import RemoteProtocolError
 
 from . import _compression
 from ._codec import CODEC_NAME_JSON, CODEC_NAME_JSON_CHARSET_UTF8, Codec
@@ -19,6 +23,8 @@ from .errors import ConnectError
 
 if TYPE_CHECKING:
     from httpx import Headers as HttpxHeaders
+
+    from .request import RequestContext
 
 
 REQ = TypeVar("REQ")
@@ -122,3 +128,50 @@ def validate_stream_response_content_type(
             Code.INTERNAL,
             f"invalid content-type: '{response_content_type}'; expecting '{CONNECT_STREAMING_CONTENT_TYPE_PREFIX}{request_codec_name}'",
         )
+
+
+_stream_error_code_regex = re.compile(
+    r".*<StreamReset .*, error_code:(\d+), .*remote_reset:True>.*"
+)
+
+
+# https://github.com/connectrpc/connect-go/blob/59cc6973156cd9164d6bea493b1d106ed894f2df/error.go#L393
+def maybe_map_stream_reset(e: Exception, ctx: RequestContext[REQ, RES]) -> None:
+    if not isinstance(e, RemoteProtocolError):
+        return None
+
+    msg = str(e)
+    # HTTPX serializes httpcore exceptions to string unfortunately
+    # https://github.com/encode/httpx/blob/ae1b9f66238f75ced3ced5e4485408435de10768/httpx/_transports/default.py#L117
+    match = _stream_error_code_regex.match(msg)
+    if not match:
+        return None
+
+    match int(match.group(1)):
+        case (
+            ErrorCodes.NO_ERROR
+            | ErrorCodes.PROTOCOL_ERROR
+            | ErrorCodes.INTERNAL_ERROR
+            | ErrorCodes.FLOW_CONTROL_ERROR
+            | ErrorCodes.SETTINGS_TIMEOUT
+            | ErrorCodes.FRAME_SIZE_ERROR
+            | ErrorCodes.COMPRESSION_ERROR
+            | ErrorCodes.CONNECT_ERROR
+        ):
+            return ConnectError(Code.INTERNAL, msg)
+        case ErrorCodes.REFUSED_STREAM:
+            return ConnectError(Code.UNAVAILABLE, msg)
+        case ErrorCodes.CANCEL:
+            # Some servers use CANCEL when deadline expires. We can't differentiate
+            # that from normal cancel without checking our own deadline.
+            if (t := ctx.timeout_ms()) is not None and t <= 0:
+                return ConnectError(Code.DEADLINE_EXCEEDED, msg)
+            return ConnectError(Code.CANCELED, msg)
+        case ErrorCodes.ENHANCE_YOUR_CALM:
+            return ConnectError(Code.RESOURCE_EXHAUSTED, f"Bandwidth exhausted: {msg}")
+        case ErrorCodes.INADEQUATE_SECURITY:
+            return ConnectError(
+                Code.PERMISSION_DENIED, f"Transport protocol insecure: {msg}"
+            )
+
+    return None
