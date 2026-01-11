@@ -5,7 +5,6 @@ import re
 from http import HTTPStatus
 from typing import TYPE_CHECKING, TypeVar
 
-from h2.errors import ErrorCodes
 from httpx import RemoteProtocolError
 
 from . import _compression
@@ -148,6 +147,9 @@ def maybe_map_stream_reset(
     match = _stream_error_code_regex.match(msg)
     if not match:
         return None
+
+    # don't need when httpx without h2 is installed
+    from h2.errors import ErrorCodes  # noqa: PLC0415
 
     match int(match.group(1)):
         case (
