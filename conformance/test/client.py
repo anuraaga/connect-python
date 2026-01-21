@@ -350,11 +350,27 @@ async def _run_test(
                                         task.cancel()
                                     request_closed.set()
 
+                                class RequestStreamSync:
+                                    def __init__(self) -> None:
+                                        self._iter = iter(request_stream_sync())
+
+                                    def __iter__(self) -> Iterator[ClientStreamRequest]:
+                                        return self
+
+                                    def __next__(self) -> ClientStreamRequest:
+                                        return next(self._iter)
+
+                                    def close(self) -> None:
+                                        print(
+                                            "Closing ClientStream request",
+                                            file=sys.stderr,
+                                        )
+
                                 task = asyncio.create_task(
                                     asyncio.to_thread(
                                         send_client_stream_request_sync,
                                         client,
-                                        request_stream_sync(),
+                                        RequestStreamSync(),
                                     )
                                 )
                             case "IdempotentUnary":
