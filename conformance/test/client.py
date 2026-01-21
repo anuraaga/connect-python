@@ -8,6 +8,7 @@ import queue
 import sys
 import time
 import traceback
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Literal, TypeVar, get_args
 
 from _util import create_standard_streams
@@ -46,7 +47,7 @@ from connectrpc.errors import ConnectError
 from connectrpc.request import Headers
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator
 
     from google.protobuf.any_pb2 import Any
 
