@@ -143,6 +143,8 @@ class SyncRequestBody(Iterator[T]):
 
     def __next__(self) -> T:
         if self._closed:
+            if (item := self._queue.get_nowait()) is not None:
+                return item
             raise StopIteration
         while True:
             try:

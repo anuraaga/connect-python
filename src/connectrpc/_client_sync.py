@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 from urllib.parse import urlencode
@@ -426,9 +427,13 @@ class ConnectClientSync:
 def _streaming_request_content(
     msgs: Iterator[Any], codec: Codec, compression: Compression | None
 ) -> Iterator[bytes]:
-    writer = ConnectEnvelopeWriter(codec, compression)
-    for msg in msgs:
-        yield writer.write(msg)
+    try:
+        writer = ConnectEnvelopeWriter(codec, compression)
+        for msg in msgs:
+            yield writer.write(msg)
+    finally:
+        with contextlib.suppress(Exception):
+            msgs.close()
 
 
 def _consume_single_response(stream: Iterator[RES]) -> RES:
