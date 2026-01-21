@@ -8,6 +8,7 @@ import queue
 import sys
 import time
 import traceback
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Literal, TypeVar, get_args
 
 from _util import create_standard_streams
@@ -46,7 +47,7 @@ from connectrpc.errors import ConnectError
 from connectrpc.request import Headers
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator
 
     from google.protobuf.any_pb2 import Any
 
@@ -128,6 +129,44 @@ def pyqwest_client_kwargs(test_request: ClientCompatRequest) -> dict:
             kwargs["tls_cert"] = test_request.client_tls_creds.cert
 
     return kwargs
+
+
+class SyncRequestBody(Iterator[T]):
+    _queue: queue.Queue[T | None]
+
+    def __init__(self) -> None:
+        self._queue = queue.Queue()
+        self._closed = False
+
+    def __iter__(self) -> Iterator[T]:
+        return self
+
+    def __next__(self) -> T:
+        if self._closed:
+            if (item := self._queue.get_nowait()) is not None:
+                return item
+            raise StopIteration
+        while True:
+            try:
+                item = self._queue.get(timeout=0.01)
+                break
+            except queue.Empty:
+                if self._closed:
+                    item = None
+                    break
+
+        if item is None:
+            raise StopIteration
+        return item
+
+    def put(self, item: T) -> None:
+        self._queue.put(item)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
 
 
 @contextlib.asynccontextmanager
@@ -221,7 +260,7 @@ async def _run_test(
                     async with client_sync(test_request) as client:
                         match test_request.method:
                             case "BidiStream":
-                                request_queue = queue.Queue()
+                                request_body = SyncRequestBody()
 
                                 def send_bidi_stream_request_sync(
                                     client: ConformanceServiceClientSync,
@@ -237,7 +276,7 @@ async def _run_test(
                                             time.sleep(
                                                 test_request.request_delay_ms / 1000.0
                                             )
-                                        request_queue.put(
+                                        request_body.put(
                                             _unpack_request(
                                                 message, BidiStreamRequest()
                                             )
@@ -263,7 +302,7 @@ async def _run_test(
                                     ):
                                         task.cancel()
 
-                                    request_queue.put(None)
+                                    request_body.close()
 
                                     request_closed.set()
 
@@ -275,18 +314,11 @@ async def _run_test(
                                         ) and len(payloads) >= num:
                                             task.cancel()
 
-                                def bidi_stream_request_sync():
-                                    while True:
-                                        request = request_queue.get()
-                                        if request is None:
-                                            return
-                                        yield request
-
                                 task = asyncio.create_task(
                                     asyncio.to_thread(
                                         send_bidi_stream_request_sync,
                                         client,
-                                        bidi_stream_request_sync(),
+                                        request_body,
                                     )
                                 )
 
@@ -318,11 +350,27 @@ async def _run_test(
                                         task.cancel()
                                     request_closed.set()
 
+                                class RequestStreamSync:
+                                    def __init__(self) -> None:
+                                        self._iter = iter(request_stream_sync())
+
+                                    def __iter__(self) -> Iterator[ClientStreamRequest]:
+                                        return self
+
+                                    def __next__(self) -> ClientStreamRequest:
+                                        return next(self._iter)
+
+                                    def close(self) -> None:
+                                        print(
+                                            "Closing ClientStream request",
+                                            file=sys.stderr,
+                                        )
+
                                 task = asyncio.create_task(
                                     asyncio.to_thread(
                                         send_client_stream_request_sync,
                                         client,
-                                        request_stream_sync(),
+                                        RequestStreamSync(),
                                     )
                                 )
                             case "IdempotentUnary":
