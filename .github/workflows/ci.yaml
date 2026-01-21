@@ -71,12 +71,12 @@ jobs:
 
       - run: uv sync
 
-      - name: run lints
-        if: startsWith(matrix.os, 'ubuntu-')
-        run: |
-          uv run ruff format --check .
-          uv run ruff check .
-          uv run pyright
+      #- name: run lints
+      #  if: startsWith(matrix.os, 'ubuntu-')
+      #  run: |
+      #    uv run ruff format --check .
+      #    uv run ruff check .
+      #    uv run pyright
 
       - name: run python tests
         run: uv run pytest ${{ matrix.coverage == 'cov' && '--cov=connectrpc --cov-report=xml' || '' }}

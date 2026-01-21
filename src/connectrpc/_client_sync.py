@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 from urllib.parse import urlencode
@@ -350,7 +351,7 @@ class ConnectClientSync:
         reader: EnvelopeReader | None = None
         resp: SyncResponse | None = None
         try:
-            request_data = _streaming_request_content(
+            request_data = StreamingRequestContent(
                 request, self._codec, self._send_compression
             )
 
@@ -423,12 +424,42 @@ class ConnectClientSync:
             raise ConnectError(Code.UNAVAILABLE, str(e)) from e
 
 
+class StreamingRequestContent:
+    def __init__(
+        self, msgs: Iterator[Any], codec: Codec, compression: Compression | None
+    ) -> Iterator[bytes]:
+        def stream():
+            for msg in self._msgs:
+                yield self._writer.write(msg)
+
+        self._iter = iter(stream())
+        self._msgs = msgs
+        self._writer = ConnectEnvelopeWriter(codec, compression)
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self._iter)
+
+    def close(self):
+        import sys
+
+        print("Closing StreamingRequestContent", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            self._msgs.close()  # pyright: ignore[reportAttributeAccessIssue]
+
+
 def _streaming_request_content(
     msgs: Iterator[Any], codec: Codec, compression: Compression | None
 ) -> Iterator[bytes]:
     writer = ConnectEnvelopeWriter(codec, compression)
-    for msg in msgs:
-        yield writer.write(msg)
+    try:
+        for msg in msgs:
+            yield writer.write(msg)
+    finally:
+        with contextlib.suppress(Exception):
+            msgs.close()  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _consume_single_response(stream: Iterator[RES]) -> RES:
