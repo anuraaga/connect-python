@@ -41,9 +41,7 @@ def coverage_env(cov: Coverage | None) -> dict[str, str] | None:
     if cov is None:
         return None
     env: dict[str, str] = {**os.environ}
-    # cov.config.source only contains . but we need .. too.
-    # It should be fine to just hard-code this.
-    env["COV_CORE_SOURCE"] = os.pathsep.join((".", ".."))
+    env["COV_CORE_SOURCE"] = os.pathsep.join(cov.config.source or ())
     if cov.config.config_file:
         env["COV_CORE_CONFIG"] = cov.config.config_file
     if cov.config.data_file:
