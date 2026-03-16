@@ -25,6 +25,7 @@
     {
       "matchCategories": ["python"],
       "matchUpdateTypes": ["*"],
+      "rangeStrategy": "bump",
       "groupName": "Python dependencies"
     },
     {
