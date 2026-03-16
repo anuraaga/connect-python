@@ -8,7 +8,7 @@
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["*"],
+      "separateMajorMinor": false,
       "groupName": "GitHub Actions"
     },
     {
@@ -17,14 +17,15 @@
         "project.dependencies",
         "project.optional-dependencies"
       ],
-      "matchFileNames": ["pyproject.toml"],
+      "matchFileNames": ["**/pyproject.toml"],
       // We manage production dependencies ourselves, only bumping
       // when necessary.
       "enabled": false
     },
     {
       "matchCategories": ["python"],
-      "matchUpdateTypes": ["*"],
+      "separateMajorMinor": false,
+      "ignoreUnstable": false,
       "groupName": "Python dependencies"
     },
     {
