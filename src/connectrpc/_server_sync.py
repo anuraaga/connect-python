@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from http import HTTPStatus
@@ -67,6 +68,8 @@ EndpointSync = (
     | EndpointServerStreamSync[_REQ, _RES]
     | EndpointUnarySync[_REQ, _RES]
 )
+
+logger = logging.getLogger("connectrpc.wsgi")
 
 
 def _normalize_wsgi_headers(environ: WSGIEnvironment) -> dict:
@@ -251,6 +254,7 @@ class ConnectWSGIApplication(ABC):
 
         except Exception as e:
             _drain_request_body(environ)
+            _maybe_log_exception(e)
             return self._handle_error(e, ctx, start_response)
 
     def _handle_unary(
@@ -502,6 +506,7 @@ class ConnectWSGIApplication(ABC):
             # response message will be handled by _response_stream, so here we have a
             # full error-only response.
             _drain_request_body(environ)
+            _maybe_log_exception(e)
             _send_stream_response_headers(
                 start_response, protocol, codec, resp_compression.name(), ctx
             )
@@ -668,3 +673,9 @@ def _drain_request_body(environ: WSGIEnvironment) -> None:
         # server that doesn't do so, so we go ahead and do it ourselves.
         for _ in _read_body(environ):
             pass
+
+
+def _maybe_log_exception(exc: Exception) -> None:
+    if isinstance(exc, (ConnectError, HTTPException)):
+        return
+    logger.exception("Exception in WSGI application")
