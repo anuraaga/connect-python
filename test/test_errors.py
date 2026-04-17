@@ -426,7 +426,7 @@ async def test_async_client_timeout(client_timeout_ms, call_timeout_ms) -> None:
     assert recorded_timeout_header == "200"
 
 
-def test_sync_unhandled_exception_logged(caplog: pytest.LogCaptureFixture) -> None:
+def test_sync_unhandled_exception_logged() -> None:
     class RaisingHaberdasher(HaberdasherSync):
         def make_hat(self, request, ctx) -> NoReturn:
             raise TypeError("Something went wrong")
@@ -436,7 +436,6 @@ def test_sync_unhandled_exception_logged(caplog: pytest.LogCaptureFixture) -> No
     http_client = SyncClient(transport)
 
     with (
-        caplog.at_level("ERROR", logger="connectrpc.wsgi"),
         HaberdasherClientSync(
             "http://localhost", timeout_ms=200, http_client=http_client
         ) as client,
@@ -444,16 +443,13 @@ def test_sync_unhandled_exception_logged(caplog: pytest.LogCaptureFixture) -> No
     ):
         client.make_hat(request=Size(inches=10))
 
-    assert len(caplog.records) == 1
-    assert caplog.records[0].getMessage() == "Exception in WSGI application"
-    assert caplog.records[0].exc_info is not None
-    assert isinstance(caplog.records[0].exc_info[1], TypeError)
-    assert str(caplog.records[0].exc_info[1]) == "Something went wrong"
+    logged_error = transport.error_stream.getvalue()
+    assert "Exception in WSGI application" in logged_error
+    assert "TypeError: Something went wrong" in logged_error
+    assert "Traceback" in logged_error
 
 
-def test_sync_unhandled_exception_logged_stream(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_sync_unhandled_exception_logged_stream() -> None:
     class RaisingHaberdasher(HaberdasherSync):
         def make_similar_hats(self, request, ctx) -> NoReturn:
             raise TypeError("Something went wrong")
@@ -463,7 +459,6 @@ def test_sync_unhandled_exception_logged_stream(
     http_client = SyncClient(transport)
 
     with (
-        caplog.at_level("ERROR", logger="connectrpc.wsgi"),
         HaberdasherClientSync(
             "http://localhost", timeout_ms=200, http_client=http_client
         ) as client,
@@ -471,8 +466,7 @@ def test_sync_unhandled_exception_logged_stream(
     ):
         next(client.make_similar_hats(request=Size(inches=10)))
 
-    assert len(caplog.records) == 1
-    assert caplog.records[0].getMessage() == "Exception in WSGI application"
-    assert caplog.records[0].exc_info is not None
-    assert isinstance(caplog.records[0].exc_info[1], TypeError)
-    assert str(caplog.records[0].exc_info[1]) == "Something went wrong"
+    logged_error = transport.error_stream.getvalue()
+    assert "Exception in WSGI application" in logged_error
+    assert "TypeError: Something went wrong" in logged_error
+    assert "Traceback" in logged_error

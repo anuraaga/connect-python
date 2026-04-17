@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import functools
 import logging
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from http import HTTPStatus
@@ -47,9 +48,9 @@ if TYPE_CHECKING:
     from .compression import Compression
 
     if sys.version_info >= (3, 11):
-        from wsgiref.types import StartResponse, WSGIEnvironment
+        from wsgiref.types import ErrorStream, StartResponse, WSGIEnvironment
     else:
-        from _typeshed.wsgi import StartResponse, WSGIEnvironment
+        from _typeshed.wsgi import ErrorStream, StartResponse, WSGIEnvironment
 else:
     StartResponse = "wsgiref.types.StartResponse"
     WSGIEnvironment = "wsgiref.types.WSGIEnvironment"
@@ -254,7 +255,7 @@ class ConnectWSGIApplication(ABC):
 
         except Exception as e:
             _drain_request_body(environ)
-            _maybe_log_exception(e)
+            _maybe_log_exception(environ, e)
             return self._handle_error(e, ctx, start_response)
 
     def _handle_unary(
@@ -506,7 +507,7 @@ class ConnectWSGIApplication(ABC):
             # response message will be handled by _response_stream, so here we have a
             # full error-only response.
             _drain_request_body(environ)
-            _maybe_log_exception(e)
+            _maybe_log_exception(environ, e)
             _send_stream_response_headers(
                 start_response, protocol, codec, resp_compression.name(), ctx
             )
@@ -675,7 +676,10 @@ def _drain_request_body(environ: WSGIEnvironment) -> None:
             pass
 
 
-def _maybe_log_exception(exc: Exception) -> None:
+def _maybe_log_exception(environ: WSGIEnvironment, exc: Exception) -> None:
     if isinstance(exc, (ConnectError, HTTPException)):
         return
-    logger.exception("Exception in WSGI application")
+    errors: ErrorStream = environ["wsgi.errors"]
+    errors.write(
+        f"Exception in WSGI application\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}"
+    )
