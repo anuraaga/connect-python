@@ -51,12 +51,10 @@ A reasonable `buf.gen.yaml`:
 ```yaml
 version: v2
 plugins:
-  - remote: buf.build/protocolbuffers/python
-    out: .
-  - remote: buf.build/protocolbuffers/pyi
-    out: .
+  - remote: buf.build/bufbuild/py
+    out: gen
   - remote: buf.build/connectrpc/python
-    out: .
+    out: gen
 ```
 
 Or, you can install the compiler (e.g. `pip install protoc-gen-connectrpc`), and
@@ -68,17 +66,35 @@ Then, you can use `protoc-gen-connectrpc` as a local plugin:
   out: .
 ```
 
-Alternatively, download a precompiled binary from the
-[releases](https://github.com/connectrpc/connect-python/releases).
-
 `protoc-gen-connectrpc` is only needed for code generation. Your actual
 application should include `connectrpc` as a dependency for the runtime
 component.
 
+#### google.protobuf compatibility
+
+Connect-Python defaults to targeting [protobuf-py](https://protobufpy.com) as the Protocol Buffers
+implementation bug Google's Protocol Buffers for Python are also fully supported. Pass `google_compat`
+to the codegen plugin to use it.
+
+```yaml
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/python
+    out: .
+  - remote: buf.build/protocolbuffers/pyi
+    out: .
+  - remote: buf.build/connectrpc/python
+    out: .
+    opt: google_compat
+```
+
+If configuring a client for JSON codec, make sure to pass `connectrpc.compat.google_protobuf_json_codec`
+instead of `connectrpc.codec.proto_json_codec`.
+
 ### Basic Client Usage
 
 ```python
-from your_service_pb2 import HelloRequest, HelloResponse
+from your_service_pb import HelloRequest, HelloResponse
 from your_service_connect import HelloServiceClient
 
 # Create async client
@@ -93,7 +109,7 @@ async def main():
 
 ```python
 from connectrpc.request import RequestContext
-from your_service_pb2 import HelloRequest, HelloResponse
+from your_service_pb import HelloRequest, HelloResponse
 from your_service_connect import HelloService, HelloServiceASGIApplication
 
 class MyHelloService(HelloService):
@@ -110,7 +126,7 @@ app = HelloServiceASGIApplication(MyHelloService())
 ### Basic Client Usage (Synchronous)
 
 ```python
-from your_service_pb2 import HelloRequest
+from your_service_pb import HelloRequest
 from your_service_connect import HelloServiceClientSync
 
 # Create sync client
@@ -254,7 +270,7 @@ connect-python provides full WSGI support via `ConnectWSGIApplication` for synch
 ```python
 from connectrpc.request import RequestContext
 from connectrpc.server import ConnectWSGIApplication
-from your_service_pb2 import Request, Response
+from your_service_pb import Request, Response
 from your_service_connect import YourService, YourServiceWSGIApplication
 
 class YourServiceImpl(YourService):

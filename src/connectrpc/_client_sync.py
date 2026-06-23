@@ -28,7 +28,6 @@ from .errors import ConnectError
 from .protocol import ProtocolType
 
 if TYPE_CHECKING:
-    import sys
     from collections.abc import Iterable, Iterator, Mapping
     from types import TracebackType
 
@@ -37,13 +36,6 @@ if TYPE_CHECKING:
     from .compression import Compression
     from .method import MethodInfo
     from .request import Headers, RequestContext
-
-    if sys.version_info >= (3, 11):
-        from typing import Self
-    else:
-        from typing_extensions import Self
-else:
-    Self = "Self"
 
 REQ = TypeVar("REQ")
 RES = TypeVar("RES")
@@ -69,6 +61,9 @@ class _ExecuteBidiStream(Protocol[REQ, RES]):
     def __call__(
         self, request: Iterator[REQ], ctx: RequestContext[REQ, RES]
     ) -> Iterator[RES]: ...
+
+
+Self = TypeVar("Self", bound="ConnectClientSync")
 
 
 class ConnectClientSync:
@@ -178,7 +173,7 @@ class ConnectClientSync:
         if not self._closed:
             self._closed = True
 
-    def __enter__(self) -> Self:
+    def __enter__(self: Self) -> Self:
         return self
 
     def __exit__(
@@ -331,8 +326,7 @@ class ConnectClientSync:
                     )
 
                 response = ctx.method.output()
-                self._codec.decode(resp.content, response)
-                return response
+                return self._codec.decode(resp.content, response)
             raise ConnectWireError.from_response(resp).to_exception()
         except TimeoutError as e:
             raise ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out") from e

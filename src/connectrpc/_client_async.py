@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import functools
 import sys
 from asyncio import CancelledError, sleep, wait_for
@@ -44,11 +43,6 @@ if TYPE_CHECKING:
     from .compression import Compression
     from .method import MethodInfo
     from .request import Headers, RequestContext
-
-    if sys.version_info >= (3, 11):
-        from typing import Self
-    else:
-        from typing_extensions import Self
 else:
     Self = "Self"
 
@@ -76,6 +70,9 @@ class _ExecuteBidiStream(Protocol[REQ, RES]):
     def __call__(
         self, request: AsyncIterator[REQ], ctx: RequestContext[REQ, RES]
     ) -> AsyncIterator[RES]: ...
+
+
+Self = TypeVar("Self", bound="ConnectClient")
 
 
 class ConnectClient:
@@ -179,7 +176,7 @@ class ConnectClient:
         if not self._closed:
             self._closed = True
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self: Self) -> Self:
         return self
 
     async def __aexit__(
@@ -334,10 +331,9 @@ class ConnectClient:
                     )
 
                 response = ctx.method.output()
-                self._codec.decode(resp.content, response)
-                return response
+                return self._codec.decode(resp.content, response)
             raise ConnectWireError.from_response(resp).to_exception()
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             raise ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out") from e
         except ConnectError:
             raise
@@ -413,7 +409,7 @@ class ConnectClient:
                         trailers=resp.trailers,
                     )
                     raise ConnectWireError.from_response(fres).to_exception()
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             raise ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out") from e
         except ConnectError:
             raise

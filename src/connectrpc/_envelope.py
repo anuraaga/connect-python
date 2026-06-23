@@ -4,6 +4,7 @@ import struct
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from ._codec import DEFAULT_REGISTRY
 from ._compression import Compression, IdentityCompression
 from .code import Code
 from .errors import ConnectError
@@ -11,6 +12,7 @@ from .errors import ConnectError
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from protobuf import Registry
     from pyqwest import Response, SyncResponse
 
     from ._codec import Codec
@@ -76,7 +78,7 @@ class EnvelopeReader(Generic[_RES]):
                     return
 
                 res = self._message_class()
-                self._codec.decode(message_data, res)
+                res = self._codec.decode(message_data, res)
                 yield res
 
             if len(self._buffer) < 5:
@@ -101,12 +103,18 @@ class EnvelopeReader(Generic[_RES]):
 
 
 class EnvelopeWriter(ABC, Generic[_T]):
-    def __init__(self, codec: Codec[_T, Any], compression: Compression | None) -> None:
+    def __init__(
+        self,
+        codec: Codec[_T, Any],
+        compression: Compression | None,
+        registry: Registry = DEFAULT_REGISTRY,
+    ) -> None:
         self._codec = codec
         self._compression = compression
         self._prefix = (
             0 if not compression or isinstance(compression, IdentityCompression) else 1
         )
+        self._registry = registry
 
     def write(self, message: _T) -> bytes:
         data = self._codec.encode(message)
