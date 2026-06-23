@@ -1,10 +1,10 @@
-# connect-python
+# Connect for Python
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![CI](https://github.com/connectrpc/connect-python/actions/workflows/ci.yaml/badge.svg)](https://github.com/connectrpc/connect-python/actions/workflows/ci.yaml)
-[![codecov](https://codecov.io/github/connectrpc/connect-python/graph/badge.svg)](https://codecov.io/github/connectrpc/connect-python)
-[![PyPI version](https://img.shields.io/pypi/v/connect-python)](https://pypi.org/project/connect-python)
-[![API Docs](https://img.shields.io/badge/API_Docs-connectrpc.github.io-blue)](https://connectrpc.github.io/connect-python/api/)
+[![CI](https://github.com/connectrpc/connect-py/actions/workflows/ci.yaml/badge.svg)](https://github.com/connectrpc/connect-py/actions/workflows/ci.yaml)
+[![codecov](https://codecov.io/github/connectrpc/connect-py/graph/badge.svg)](https://codecov.io/github/connectrpc/connect-py)
+[![PyPI version](https://img.shields.io/pypi/v/connect-py)](https://pypi.org/project/connect-py)
+[![API Docs](https://img.shields.io/badge/API_Docs-connectrpc.github.io-blue)](https://connectrpc.github.io/connect-py/api/)
 
 A Python implementation of [Connect](https://connectrpc.com/): Protobuf RPC that works.
 
@@ -69,7 +69,7 @@ Then, you can use `protoc-gen-connectrpc` as a local plugin:
 ```
 
 Alternatively, download a precompiled binary from the
-[releases](https://github.com/connectrpc/connect-python/releases).
+[releases](https://github.com/connectrpc/connect-py/releases).
 
 `protoc-gen-connectrpc` is only needed for code generation. Your actual
 application should include `connectrpc` as a dependency for the runtime
@@ -128,7 +128,7 @@ Check out [the docs](https://connectrpc.com/docs/python/getting-started) for mor
 
 ## Streaming Support
 
-connect-python supports all RPC streaming types:
+Connect supports all RPC streaming types:
 
 - **Unary**: Single request, single response
 - **Server Streaming**: Single request, multiple responses
@@ -236,12 +236,12 @@ We verify the following servers with ConnectRPC's conformance suite.
 
 For ASGI servers:
 
-- [pyvoy](https://pyvoy.dev) - Fully-featured ASGI server, enables all of Connect-Python's features
+- [pyvoy](https://pyvoy.dev) - Fully-featured ASGI server, enables all of Connect's features
 - [Uvicorn](https://www.uvicorn.org/) - Lightning-fast ASGI server for HTTP/1
 
 For WSGI servers:
 
-- [pyvoy](https://pyvoy.dev) - Fully-featured WSGI server, enables all of Connect-Python's features
+- [pyvoy](https://pyvoy.dev) - Fully-featured WSGI server, enables all of Connect's features
 - [Gunicorn](https://gunicorn.org/) - Python WSGI HTTP Server for HTTP/1
 
 Other ASGI and WSGI servers should also generally work though we have found some issues with flakiness
@@ -249,7 +249,7 @@ with our conformance tests. If you don't have any preference, we recommend one o
 
 ## WSGI Support
 
-connect-python provides full WSGI support via `ConnectWSGIApplication` for synchronous Python applications. This enables integration with traditional WSGI servers like Gunicorn and uWSGI.
+Connect provides full WSGI support via `ConnectWSGIApplication` for synchronous Python applications. This enables integration with traditional WSGI servers like Gunicorn and uWSGI.
 
 ```python
 from connectrpc.request import RequestContext
@@ -275,7 +275,7 @@ app = YourServiceWSGIApplication(YourServiceImpl())
 
 ## Compression Support
 
-connect-python supports multiple compression algorithms:
+Connect supports multiple compression algorithms:
 
 - **gzip**: Built-in support, always available
 - **brotli**: Available when `brotli` package is installed
@@ -327,7 +327,7 @@ client = HelloServiceClient(
 
 ### Connect GET Support
 
-connect-python automatically enables GET request support for methods marked with `idempotency_level = NO_SIDE_EFFECTS` in your proto files:
+Connect automatically enables GET request support for methods marked with `idempotency_level = NO_SIDE_EFFECTS` in your proto files:
 
 ```proto
 service YourService {
@@ -347,7 +347,7 @@ response = await client.get_data(request)
 
 ### CORS Support
 
-connect-python works with any ASGI CORS middleware. For example, using Starlette:
+Connect works with any ASGI CORS middleware. For example, using Starlette:
 
 ```python
 from starlette.middleware.cors import CORSMiddleware

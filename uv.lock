@@ -4,9 +4,9 @@ requires-python = ">=3.10"
 
 [manifest]
 members = [
-    "connect-python-example",
     "connectrpc",
     "connectrpc-otel",
+    "example",
 ]
 
 [[package]]
@@ -150,25 +150,6 @@ wheels = [
 ]
 
 [[package]]
-name = "connect-python-example"
-version = "0.1.0"
-source = { editable = "example" }
-dependencies = [
-    { name = "connectrpc" },
-    { name = "flask" },
-    { name = "protobuf" },
-    { name = "starlette" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "connectrpc", editable = "." },
-    { name = "flask", specifier = "==3.1.3" },
-    { name = "protobuf", specifier = ">=5.28" },
-    { name = "starlette", specifier = "==1.3.1" },
-]
-
-[[package]]
 name = "connectrpc"
 version = "0.11.0"
 source = { editable = "." }
@@ -182,7 +163,7 @@ dev = [
     { name = "asgiref" },
     { name = "brotli" },
     { name = "buf-bin" },
-    { name = "connect-python-example" },
+    { name = "example" },
     { name = "granian" },
     { name = "grpcio-tools" },
     { name = "gunicorn" },
@@ -221,7 +202,7 @@ dev = [
     { name = "asgiref", specifier = "==3.11.1" },
     { name = "brotli", specifier = "==1.2.0" },
     { name = "buf-bin", specifier = "==1.71.0" },
-    { name = "connect-python-example", editable = "example" },
+    { name = "example", editable = "example" },
     { name = "granian", specifier = "==2.7.6" },
     { name = "grpcio-tools", specifier = "==1.81.1" },
     { name = "gunicorn", specifier = "==26.0.0" },
@@ -260,8 +241,8 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "connect-python-example" },
     { name = "connectrpc" },
+    { name = "example" },
     { name = "pytest" },
 ]
 
@@ -273,8 +254,8 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "connect-python-example", editable = "example" },
     { name = "connectrpc", editable = "." },
+    { name = "example", editable = "example" },
     { name = "pytest", specifier = "==9.1.1" },
 ]
 
@@ -399,6 +380,25 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/45/6d/cd5d85a0894dca0250ead9eca2a8cf289d402532e21ce139955cbffe3d5c/envoy_server-1.38.2-py3-none-manylinux_2_31_aarch64.whl", hash = "sha256:8b1b1bea393578e886a26350e3ab8738a066372869e82f54be464f4a914c9df4", size = 33130103, upload-time = "2026-06-17T05:29:42.721Z" },
     { url = "https://files.pythonhosted.org/packages/96/d6/3c616c0a4c9833605b4e931cadd9f45149894b557d17d0e7df5bc75b6f92/envoy_server-1.38.2-py3-none-manylinux_2_31_x86_64.whl", hash = "sha256:c1e2e293364686e3ee79b32f9743bb1f7fd40c196945cb9062fbb25655d35188", size = 34996584, upload-time = "2026-06-17T05:29:46.832Z" },
     { url = "https://files.pythonhosted.org/packages/03/8e/4d6967af64c47f078952ab489df1bfa5009427f53263b5cb37152eec1930/envoy_server-1.38.2-py3-none-win_amd64.whl", hash = "sha256:f1dc9e3589c0df939cba59615790b7ff62405d91bf4b3e4db1cbaad151cbdf2f", size = 19559475, upload-time = "2026-06-17T05:29:50.478Z" },
+]
+
+[[package]]
+name = "example"
+version = "0.1.0"
+source = { editable = "example" }
+dependencies = [
+    { name = "connectrpc" },
+    { name = "flask" },
+    { name = "protobuf" },
+    { name = "starlette" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "connectrpc", editable = "." },
+    { name = "flask", specifier = "==3.1.3" },
+    { name = "protobuf", specifier = ">=5.28" },
+    { name = "starlette", specifier = "==1.3.1" },
 ]
 
 [[package]]

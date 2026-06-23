@@ -47,12 +47,12 @@ jobs:
         with:
           subject-checksums: out/checksums.txt
 
-      - name: publish connect-python
+      - name: publish connectrpc
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           skip-existing: true
 
-      - name: publish protoc-gen-connect-python
+      - name: publish protoc-gen-connectrpc
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: protoc-gen-connect-python/dist

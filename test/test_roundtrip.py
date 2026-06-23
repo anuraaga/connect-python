@@ -291,7 +291,7 @@ async def test_message_limit_async(client_bad: bool, compression_name: str) -> N
 async def test_server_stream_client_disconnect() -> None:
     """Server streaming generator should be closed when the client disconnects.
 
-    Regression test for https://github.com/connectrpc/connect-python/issues/174.
+    Regression test for https://github.com/connectrpc/connect-py/issues/174.
     """
     generator_closed = asyncio.Event()
 
