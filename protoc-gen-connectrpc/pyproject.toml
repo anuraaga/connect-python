@@ -43,7 +43,7 @@ classifiers = [
   "Topic :: Software Development :: Compilers",
   "Topic :: System :: Networking",
 ]
-dependencies = ["protobuf-py"]
+dependencies = ["protobuf-py==0.0.2"]
 
 [project.urls]
 Homepage = "https://github.com/connectrpc/connect-python"
