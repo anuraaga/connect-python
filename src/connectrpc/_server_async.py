@@ -31,6 +31,7 @@ from ._server_shared import (
     EndpointServerStream,
     EndpointUnary,
 )
+from ._server_websocket import upgrade_websocket
 from .code import Code
 from .errors import ConnectError
 from .request import Headers, RequestContext
@@ -121,10 +122,6 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
     async def __call__(
         self, scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable
     ) -> None:
-        if scope["type"] == "websocket":
-            msg = "connect does not support websockets"
-            raise RuntimeError(msg)
-
         if scope["type"] == "lifespan":
             service_iter = None
             while True:
@@ -175,6 +172,17 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             )
         endpoints = self._resolved_endpoints
 
+        is_websocket = scope["type"] == "websocket"
+        if is_websocket:
+            # Adapt the connection to look like a Connect streaming HTTP
+            # request, with the request head coming from the first message.
+            # The rest of the control flow is unchanged.
+            upgraded = await upgrade_websocket(scope, receive, send)
+            if upgraded is None:
+                # Handshake failed; the connection was closed.
+                return None
+            scope, receive, send = upgraded
+
         ctx: RequestContext | None = None
         try:
             path = scope["path"]
@@ -211,8 +219,11 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                 codec_name = query_params.get("encoding", ("",))[0]
             else:
                 query_params = _UNSET_QUERY_PARAMS
+                # WebSocket requests use unary-style content types
+                # (e.g. application/json) even for streams.
                 codec_name = protocol.codec_name_from_content_type(
-                    headers.get("content-type", ""), stream=not is_unary
+                    headers.get("content-type", ""),
+                    stream=not is_unary and not is_websocket,
                 )
             codec = self._codecs.get(codec_name)
             if not codec:
@@ -221,7 +232,12 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     [("Accept-Post", "application/json, application/proto")],
                 )
 
-            if is_unary and isinstance(protocol, ConnectServerProtocol):
+            # Over WebSocket, unary RPCs also use the streaming message flow.
+            if (
+                is_unary
+                and not is_websocket
+                and isinstance(protocol, ConnectServerProtocol)
+            ):
                 return await self._handle_unary_connect(
                     http_method,
                     headers,
