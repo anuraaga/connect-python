@@ -29,6 +29,9 @@ _PROTO_BINARY_CODEC = google_protobuf_binary_codec()
 _GZIP_COMPRESSION = GzipCompression()
 
 class NoMethods(Protocol):
+    """
+    A service without any methods.
+    """
     pass
 
 class NoMethodsASGIApplication(ConnectASGIApplication[NoMethods]):
@@ -58,6 +61,9 @@ class NoMethodsASGIApplication(ConnectASGIApplication[NoMethods]):
 
 
 class NoMethodsClient(ConnectClient):
+    """
+    A service without any methods.
+    """
     def __init__(
         self,
         address: str,
@@ -84,6 +90,9 @@ class NoMethodsClient(ConnectClient):
         )
 
 class NoMethodsSync(Protocol):
+    """
+    A service without any methods.
+    """
     pass
 
 class NoMethodsWSGIApplication(ConnectWSGIApplication):
@@ -111,6 +120,9 @@ class NoMethodsWSGIApplication(ConnectWSGIApplication):
 
 
 class NoMethodsClientSync(ConnectClientSync):
+    """
+    A service without any methods.
+    """
     def __init__(
         self,
         address: str,

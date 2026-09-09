@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 
 class NoMethods(Protocol):
+    """
+    A service without any methods.
+    """
     @classmethod
     def desc(cls) -> DescService:
         """Returns the descriptor for this service."""
@@ -55,9 +58,15 @@ class NoMethodsASGIApplication(ConnectASGIApplication[NoMethods]):
 
 
 class NoMethodsClient(ConnectClient):
+    """
+    A service without any methods.
+    """
     pass
 
 class NoMethodsSync(Protocol):
+    """
+    A service without any methods.
+    """
     @classmethod
     def desc(cls) -> DescService:
         """Returns the descriptor for this service."""
@@ -88,4 +97,7 @@ class NoMethodsWSGIApplication(ConnectWSGIApplication):
 
 
 class NoMethodsClientSync(ConnectClientSync):
+    """
+    A service without any methods.
+    """
     pass
