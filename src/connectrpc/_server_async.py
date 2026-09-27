@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Generic, TypeVar, cast
 from urllib.parse import parse_qs
 
 from ._codec import Codec, get_default_codecs
-from ._compression import negotiate_compression, resolve_compressions
+from ._compression import (
+    negotiate_compression,
+    resolve_compressions,
+    unknown_compression_error,
+)
 from ._envelope import EnvelopeReader
 from ._interceptor_async import (
     BidiStreamInterceptor,
@@ -338,13 +342,10 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             message = message.encode("utf-8")
 
         # Handle compression
-        compression_name = params.get("compression", ["identity"])[0]
+        compression_name = params.get("compression", [""])[0] or "identity"
         compression = self._compressions.get(compression_name)
         if not compression:
-            raise ConnectError(
-                Code.UNIMPLEMENTED,
-                f"unknown compression: '{compression_name}': supported encodings are {', '.join(self._compressions.keys())}",
-            )
+            raise unknown_compression_error(compression_name, self._compressions)
 
         # Decompress and decode message
         if message:  # Don't decompress empty messages
@@ -375,13 +376,10 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         req_body = b"".join(chunks)
 
         # Handle compression if specified
-        compression_name = headers.get("content-encoding", "identity").lower()
+        compression_name = headers.get("content-encoding") or "identity"
         compression = self._compressions.get(compression_name)
         if not compression:
-            raise ConnectError(
-                Code.UNIMPLEMENTED,
-                f"unknown compression: '{compression_name}': supported encodings are {', '.join(self._compressions.keys())}",
-            )
+            raise unknown_compression_error(compression_name, self._compressions)
 
         if req_body:  # Don't decompress empty body
             req_body = compression.decompress(req_body, self._read_max_bytes)
@@ -410,8 +408,9 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         try:
             await metadata_run.start()
             if not req_compression:
-                raise ConnectError(
-                    Code.UNIMPLEMENTED, "Unrecognized request compression"
+                raise unknown_compression_error(
+                    headers.get(protocol.compression_header_name(), ""),
+                    self._compressions,
                 )
             request_stream = _request_stream(
                 receive,
