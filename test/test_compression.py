@@ -293,7 +293,6 @@ def test_stream_request_compression(
     assert (compression.name() if compression else None) == expected
 
 
-# An empty compression means identity, as in connect-go.
 _empty_compression_requests = [
     pytest.param(
         "POST",
