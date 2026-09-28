@@ -34,6 +34,7 @@ from ._protocol_connect import (
     ConnectServerProtocol,
     codec_name_from_content_type,
 )
+from ._protocol_grpc import GRPCServerProtocol
 from ._protocol_server import negotiate_server_protocol
 from ._server_shared import (
     DEFAULT_READ_MAX_BYTES,
@@ -236,6 +237,7 @@ class ConnectWSGIApplication(ABC):
         self, environ: WSGIEnvironment, start_response: StartResponse
     ) -> Iterable[bytes]:
         ctx: RequestContext | None = None
+        protocol: ServerProtocol | None = None
         request_body = _RequestBody.from_environ(environ)
         try:
             path = environ["PATH_INFO"]
@@ -298,7 +300,7 @@ class ConnectWSGIApplication(ABC):
         except Exception as e:  # noqa: BLE001 # invoking user callback
             _drain_request_body(environ, request_body)
             _maybe_log_exception(environ, e)
-            return self._handle_error(e, ctx, start_response)
+            return self._handle_error(e, ctx, protocol, start_response)
 
     def _handle_unary(
         self,
@@ -590,12 +592,22 @@ class ConnectWSGIApplication(ABC):
             ]
 
     def _handle_error(
-        self, exc: Exception, ctx: RequestContext | None, start_response: StartResponse
+        self,
+        exc: Exception,
+        ctx: RequestContext | None,
+        protocol: ServerProtocol | None,
+        start_response: StartResponse,
     ) -> Iterable[bytes]:
         """Handle and log errors with detailed information."""
         headers: list[tuple[str, str]]
         body: list[bytes]
         status: str
+        if isinstance(protocol, GRPCServerProtocol) and not isinstance(exc, HTTPError):
+            # gRPC clients read the status from trailers, so this is a trailers-only
+            # response: HTTP 200 with the gRPC status in the headers.
+            grpc_headers = protocol.trailers_only_headers(ctx, exc)
+            start_response("200 OK", list(grpc_headers.allitems()))
+            return []
         if isinstance(exc, HTTPError):
             headers = exc.headers
             body = []
