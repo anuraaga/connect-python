@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from http import HTTPStatus
 from typing import TYPE_CHECKING, NoReturn
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, NoReturn
 import pytest
 from pyqwest import (
     Client,
+    FullResponse,
     Headers,
     Request,
     Response,
@@ -334,27 +336,42 @@ _client_errors = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("method", "path", "headers", "body", "response_status", "response_headers"),
-    _client_errors,
-)
-def test_sync_client_errors(
-    method, path, headers, body, response_status, response_headers
-) -> None:
+@pytest.fixture(params=["asgi", "wsgi"])
+def transport(request: pytest.FixtureRequest) -> ASGITransport | WSGITransport:
+    if request.param == "asgi":
+
+        class ValidHaberdasher(Haberdasher):
+            async def make_hat(self, _request, _ctx):
+                return Hat()
+
+        return ASGITransport(HaberdasherASGIApplication(ValidHaberdasher()))
+
     class ValidHaberdasherSync(HaberdasherSync):
         def make_hat(self, _request, _ctx):
             return Hat()
 
-    app = HaberdasherWSGIApplication(ValidHaberdasherSync())
-    transport = WSGITransport(app)
+    return WSGITransport(HaberdasherWSGIApplication(ValidHaberdasherSync()))
 
-    client = SyncClient(transport)
-    response = client.execute(
-        method=method, url=f"http://localhost{path}", content=body, headers=headers
+
+async def _execute(
+    transport: ASGITransport | WSGITransport,
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> FullResponse:
+    url = f"http://localhost{path}"
+    if isinstance(transport, WSGITransport):
+        return await asyncio.to_thread(
+            SyncClient(transport).execute,
+            method=method,
+            url=url,
+            content=body,
+            headers=headers,
+        )
+    return await Client(transport).execute(
+        method=method, url=url, content=body, headers=headers
     )
-
-    assert response.status == response_status
-    assert response.headers == response_headers
 
 
 @pytest.mark.asyncio
@@ -362,21 +379,10 @@ def test_sync_client_errors(
     ("method", "path", "headers", "body", "response_status", "response_headers"),
     _client_errors,
 )
-async def test_async_client_errors(
-    method, path, headers, body, response_status, response_headers
+async def test_client_errors(
+    transport, method, path, headers, body, response_status, response_headers
 ) -> None:
-    class ValidHaberdasher(Haberdasher):
-        async def make_hat(self, _request, _ctx):
-            return Hat()
-
-    haberdasher = ValidHaberdasher()
-    app = HaberdasherASGIApplication(haberdasher)
-    transport = ASGITransport(app)
-
-    client = Client(transport)
-    response = await client.execute(
-        method=method, url=f"http://localhost{path}", content=body, headers=headers
-    )
+    response = await _execute(transport, method, path, headers, body)
 
     assert response.status == response_status
     assert response.headers == response_headers
@@ -732,3 +738,54 @@ def test_unicode_error_body_utf8_stream() -> None:
 
     assert res.status == 200
     assert message.encode() in res.content
+
+
+def _envelope(flags: int, payload: bytes) -> bytes:
+    return bytes([flags]) + len(payload).to_bytes(4, "big") + payload
+
+
+_malformed_requests = [
+    pytest.param(
+        "MakeHat",
+        {"content-type": "application/proto"},
+        b"\xff\xff\xff",
+        id="unary message",
+    ),
+    pytest.param(
+        "MakeHat",
+        {"content-type": "application/proto", "content-encoding": "gzip"},
+        b"not gzip",
+        id="unary compression",
+    ),
+    pytest.param(
+        "MakeSimilarHats",
+        {"content-type": "application/connect+proto"},
+        _envelope(0, b"\xff\xff\xff"),
+        id="stream message",
+    ),
+    pytest.param(
+        "MakeSimilarHats",
+        {
+            "content-type": "application/connect+proto",
+            "connect-content-encoding": "gzip",
+        },
+        _envelope(1, b"not gzip"),
+        id="stream compression",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "headers", "body"), _malformed_requests)
+async def test_malformed_request(transport, method, headers, body) -> None:
+    res = await _execute(
+        transport, "POST", f"/connectrpc.example.Haberdasher/{method}", headers, body
+    )
+
+    if res.status == 200:
+        # A stream that fails before any response message has only the end message.
+        error = json.loads(res.content[5:])["error"]
+    else:
+        error = json.loads(res.content)
+    assert error["code"] == "invalid_argument"
+    assert transport.app_exception is None
