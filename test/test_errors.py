@@ -691,13 +691,20 @@ async def test_async_server_cancelled(protocol: ProtocolType, method: str) -> No
     outer_exceptions: list[BaseException] = []
 
     async def cancelling_app(scope, receive, send) -> None:
-        # Middleware that cancels the application, which only raises
-        # TimeoutError if the application propagates the cancellation.
+        # Middleware that cancels the task running the application, like an
+        # ASGI server does. Cancel the current task rather than using
+        # wait_for, which runs the application in a separate task on
+        # Python 3.10.
+        task = asyncio.current_task()
+        assert task is not None
+        handle = asyncio.get_running_loop().call_later(0.05, task.cancel)
         try:
-            await asyncio.wait_for(app(scope, receive, send), 0.05)
+            await app(scope, receive, send)
         except BaseException as e:
             outer_exceptions.append(e)
             raise
+        finally:
+            handle.cancel()
 
     async with HaberdasherClient(
         "http://localhost",
@@ -712,8 +719,9 @@ async def test_async_server_cancelled(protocol: ProtocolType, method: str) -> No
     assert len(interceptor.errors) == 1
     assert isinstance(interceptor.errors[0], ConnectError)
     assert interceptor.errors[0].code == Code.CANCELED
+    # The application propagates the cancellation instead of swallowing it.
     assert len(outer_exceptions) == 1
-    assert isinstance(outer_exceptions[0], asyncio.TimeoutError)
+    assert isinstance(outer_exceptions[0], asyncio.CancelledError)
 
 
 @pytest.mark.asyncio
