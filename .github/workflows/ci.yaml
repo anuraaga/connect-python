@@ -63,6 +63,9 @@ jobs:
     env:
       # Shared env variables for all the tests
       UV_RESOLUTION: "${{ matrix.resolution }}"
+      # brotli is actually threadsafe but doesn't declare it, so we force GIL off.
+      # We want to run the tests with GIL off either way so there isn't really any issue with it.
+      PYTHON_GIL: ${{ endsWith(matrix.python, 't') && '0' || '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
