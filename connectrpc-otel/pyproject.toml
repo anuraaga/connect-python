@@ -1,7 +1,7 @@
 [project]
 name = "connectrpc-otel"
 version = "0.2.0"
-description = "OpenTelemetry instrumentation for connectrpc"
+description = "OpenTelemetry instrumentation for Connect RPC"
 readme = "README.md"
 requires-python = ">= 3.11"
 license = "Apache-2.0"
