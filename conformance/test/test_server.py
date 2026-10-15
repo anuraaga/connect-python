@@ -100,6 +100,11 @@ def test_server_async(server: str, cov: Coverage) -> None:
             "server",
             *opts,
             *_known_flaky,
+            "--known-flaky",
+            # There is a race between our server and the conformance runner itself completing a timeout
+            # that causes errors.
+            # TODO: Remove after https://github.com/connectrpc/conformance/pull/1155
+            "Timeouts/**",
             "--",
             *args,
         ],
