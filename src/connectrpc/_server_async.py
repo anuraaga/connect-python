@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import functools
@@ -11,7 +12,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Generic, TypeVar, cast
 from urllib.parse import parse_qs
 
-from ._asyncio_timeout import timeout_at as asyncio_timeout_at
 from ._codec import Codec, get_default_codecs
 from ._compression import (
     negotiate_compression,
@@ -293,7 +293,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         # Important to propagate cancellation to app servers as-is
         cancelled_error: CancelledError | None = None
         try:
-            async with asyncio_timeout_at(deadline):
+            async with asyncio.timeout_at(deadline):
                 await metadata_run.start()
                 if http_method == "GET":
                     request = await self._read_get_request(
@@ -444,7 +444,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         # Important to propagate cancellation to app servers as-is
         cancelled_error: CancelledError | None = None
         try:
-            async with asyncio_timeout_at(deadline):
+            async with asyncio.timeout_at(deadline):
                 await metadata_run.start()
                 if not req_compression:
                     raise unknown_compression_error(
