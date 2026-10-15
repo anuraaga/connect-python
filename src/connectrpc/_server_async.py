@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextlib
 import functools
@@ -309,7 +308,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             cancelled_error = e
             error = ConnectError(Code.CANCELED, "Request was cancelled")
             error.__cause__ = e
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
             error.__cause__ = e
         except Exception as e:  # noqa: BLE001 # re-raised after ending the run
@@ -535,7 +534,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             cancelled_error = e
             error = ConnectError(Code.CANCELED, "Request was cancelled")
             error.__cause__ = e
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
             error.__cause__ = e
         except Exception as e:  # noqa: BLE001 # invoking user callback
