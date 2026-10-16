@@ -693,8 +693,7 @@ async def test_async_server_cancelled(protocol: ProtocolType, method: str) -> No
     async def cancelling_app(scope, receive, send) -> None:
         # Middleware that cancels the task running the application, like an
         # ASGI server does. Cancel the current task rather than using
-        # wait_for, which runs the application in a separate task on
-        # Python 3.10.
+        # wait_for, which may run the application in a separate task.
         task = asyncio.current_task()
         assert task is not None
         handle = asyncio.get_running_loop().call_later(0.05, task.cancel)
@@ -743,6 +742,50 @@ async def test_async_unhandled_exception_reraised() -> None:
 
     assert isinstance(transport.app_exception, TypeError)
     assert str(transport.app_exception) == "Something went wrong"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _protocols)
+@pytest.mark.parametrize("method", ["unary", "server_stream"])
+async def test_async_handler_timeout_error_reraised(
+    protocol: ProtocolType, method: str
+) -> None:
+    class RaisingHaberdasher(Haberdasher):
+        async def make_hat(self, _request, _ctx) -> NoReturn:
+            msg = "database query timed out"
+            raise TimeoutError(msg)
+
+        async def make_similar_hats(self, _request, _ctx) -> AsyncIterator[Hat]:
+            msg = "database query timed out"
+            raise TimeoutError(msg)
+            yield Hat()
+
+    app = HaberdasherASGIApplication(RaisingHaberdasher())
+    app_exceptions: list[BaseException] = []
+
+    async def recording_app(scope, receive, send) -> None:
+        # ASGITransport does not record a TimeoutError in app_exception.
+        try:
+            await app(scope, receive, send)
+        except BaseException as e:
+            app_exceptions.append(e)
+            raise
+
+    async with HaberdasherClient(
+        "http://localhost",
+        protocol=protocol,
+        http_client=Client(ASGITransport(recording_app)),
+    ) as client:
+        with pytest.raises(ConnectError) as exc_info:
+            if method == "unary":
+                await client.make_hat(request=Size(inches=10))
+            else:
+                async for _ in client.make_similar_hats(request=Size(inches=10)):
+                    pass
+
+    assert exc_info.value.code == Code.UNKNOWN
+    assert len(app_exceptions) == 1
+    assert isinstance(app_exceptions[0], TimeoutError)
 
 
 @pytest.mark.asyncio

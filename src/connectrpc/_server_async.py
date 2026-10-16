@@ -293,7 +293,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         # Important to propagate cancellation to app servers as-is
         cancelled_error: CancelledError | None = None
         try:
-            async with asyncio.timeout_at(deadline):
+            async with (timeout := asyncio.timeout_at(deadline)):
                 await metadata_run.start()
                 if http_method == "GET":
                     request = await self._read_get_request(
@@ -309,8 +309,11 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             error = ConnectError(Code.CANCELED, "Request was cancelled")
             error.__cause__ = e
         except TimeoutError as e:
-            error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
-            error.__cause__ = e
+            if timeout.expired():
+                error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
+                error.__cause__ = e
+            else:
+                error = e
         except Exception as e:  # noqa: BLE001 # re-raised after ending the run
             error = e
         finally:
@@ -444,7 +447,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         # Important to propagate cancellation to app servers as-is
         cancelled_error: CancelledError | None = None
         try:
-            async with asyncio.timeout_at(deadline):
+            async with (timeout := asyncio.timeout_at(deadline)):
                 await metadata_run.start()
                 if not req_compression:
                     raise unknown_compression_error(
@@ -535,8 +538,11 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             error = ConnectError(Code.CANCELED, "Request was cancelled")
             error.__cause__ = e
         except TimeoutError as e:
-            error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
-            error.__cause__ = e
+            if timeout.expired():
+                error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
+                error.__cause__ = e
+            else:
+                error = e
         except Exception as e:  # noqa: BLE001 # invoking user callback
             error = e
         finally:
