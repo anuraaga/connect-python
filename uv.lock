@@ -127,7 +127,7 @@ wheels = [
 
 [[package]]
 name = "connectrpc"
-version = "0.12.1"
+version = "0.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "protobuf-py" },
@@ -1110,7 +1110,7 @@ wheels = [
 
 [[package]]
 name = "protoc-gen-connectrpc"
-version = "0.12.1"
+version = "0.13.0"
 source = { editable = "protoc-gen-connectrpc" }
 dependencies = [
     { name = "protobuf-py" },
