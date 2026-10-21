@@ -218,7 +218,7 @@ docs = [
 
 [[package]]
 name = "connectrpc-grpcreflect"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "connectrpc-grpcreflect" }
 dependencies = [
     { name = "connectrpc" },
@@ -241,7 +241,7 @@ dev = [{ name = "pytest", specifier = "==9.1.1" }]
 
 [[package]]
 name = "connectrpc-otel"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "connectrpc-otel" }
 dependencies = [
     { name = "opentelemetry-api" },
