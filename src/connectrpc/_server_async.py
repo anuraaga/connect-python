@@ -15,9 +15,9 @@ from asyncio import (
     sleep,
     timeout_at as asyncio_timeout_at,
 )
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 from urllib.parse import parse_qs
 
 from ._codec import Codec, get_default_codecs
@@ -76,7 +76,6 @@ if TYPE_CHECKING:
         Scope,
     )
 
-    from . import _server_shared
     from ._server_trio import TrioLoop, TrioTimeout
     from .compression import Compression
 else:
@@ -162,6 +161,101 @@ class _RequestReceiver:
         return message
 
 
+@dataclass(slots=True)
+class _UnaryResponse:
+    """How a Connect unary request's response is written."""
+
+    codec: Codec
+    compression: Compression
+
+    async def send(
+        self, send: _ResponseSender, response_data: object, ctx: RequestContext
+    ) -> None:
+        res_bytes = self.compression.compress(self.codec.encode(response_data))
+        headers: list[tuple[bytes, bytes]] = [
+            (
+                b"content-type",
+                f"{CONNECT_UNARY_CONTENT_TYPE_PREFIX}{self.codec.name()}".encode(),
+            ),
+            (b"content-encoding", self.compression.name().encode()),
+            (b"vary", b"Accept-Encoding"),
+        ]
+        _add_context_headers(headers, ctx)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": headers,
+                "trailers": False,
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": res_bytes, "more_body": False}
+        )
+
+
+@dataclass(slots=True)
+class _StreamResponse:
+    """How a stream's response is written."""
+
+    protocol: ServerProtocol
+    codec: Codec
+    compression: Compression
+    writer: EnvelopeWriter
+    request_stream: AsyncGenerator[Any] | None = None
+
+    async def send_headers(self, send: _ResponseSender, ctx: RequestContext) -> None:
+        headers = [
+            (b"content-type", self.protocol.content_type(self.codec).encode()),
+            (
+                self.protocol.compression_header_name().encode(),
+                self.compression.name().encode(),
+            ),
+        ]
+        headers.extend(
+            (key.encode(), value.encode())
+            for key, value in ctx.response_headers.allitems()
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": headers,
+                "trailers": self.protocol.uses_trailers(),
+            }
+        )
+
+    async def end(
+        self, send: _ResponseSender, error: Exception | None, ctx: RequestContext
+    ) -> bool:
+        """End the stream, unless a failed send means it can't be."""
+        if send.failed:
+            return False
+        if not send.started:
+            # Exception before any response message is returned
+            await self.send_headers(send, ctx)
+        end_message = self.writer.end(
+            ctx.response_trailers,
+            ConnectWireError.from_exception(error) if error else None,
+        )
+        if isinstance(end_message, bytes):
+            await send(
+                {"type": "http.response.body", "body": end_message, "more_body": False}
+            )
+            return True
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        await send(
+            {
+                "type": "http.response.trailers",
+                "headers": [
+                    (k.encode(), v.encode()) for k, v in end_message.allitems()
+                ],
+                "more_trailers": False,
+            }
+        )
+        return True
+
+
 class ConnectASGIApplication(ABC, Generic[_SVC]):
     """An ASGI application for the Connect protocol."""
 
@@ -216,44 +310,8 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             raise RuntimeError(msg)
 
         if scope["type"] == "lifespan":
-            service_iter = None
-            while True:
-                msg = await receive()
-                match msg["type"]:
-                    case "lifespan.startup":
-                        # Need to cast since type checking doesn't seem to narrow well with isasyncgen
-                        if inspect.isasyncgen(self._service):
-                            service_iter = cast(
-                                "AsyncGenerator[_SVC, None]", self._service
-                            )
-                            try:
-                                service = await anext(service_iter)
-                            except Exception as e:  # noqa: BLE001 # invoking user callback
-                                await send(
-                                    {
-                                        "type": "lifespan.startup.failed",
-                                        "message": str(e),
-                                    }
-                                )
-                                return None
-                        else:
-                            service = cast("_SVC", self._service)
-                        self._resolved_endpoints = self._resolve_endpoints(service)
-                        await send({"type": "lifespan.startup.complete"})
-                    case "lifespan.shutdown":
-                        if service_iter is not None:
-                            try:
-                                await service_iter.aclose()
-                            except Exception as e:  # noqa: BLE001 # invoking user callback
-                                await send(
-                                    {
-                                        "type": "lifespan.shutdown.failed",
-                                        "message": str(e),
-                                    }
-                                )
-                                return None
-                        await send({"type": "lifespan.shutdown.complete"})
-                        return None
+            await self._handle_lifespan(receive, send)
+            return
 
         if self._resolved_endpoints is None:
             if inspect.isasyncgen(self._service):
@@ -263,89 +321,240 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             self._resolved_endpoints = self._resolve_endpoints(
                 cast("_SVC", self._service)
             )
-        endpoints = self._resolved_endpoints
+        await self._handle_request(scope, receive, send, self._resolved_endpoints)
 
+    async def _handle_lifespan(
+        self, receive: ASGIReceiveCallable, send: ASGISendCallable
+    ) -> None:
+        service_iter = None
+        while True:
+            msg = await receive()
+            match msg["type"]:
+                case "lifespan.startup":
+                    # Need to cast since type checking doesn't seem to narrow well with isasyncgen
+                    if inspect.isasyncgen(self._service):
+                        service_iter = cast("AsyncGenerator[_SVC, None]", self._service)
+                        try:
+                            service = await anext(service_iter)
+                        except Exception as e:  # noqa: BLE001 # invoking user callback
+                            await send(
+                                {"type": "lifespan.startup.failed", "message": str(e)}
+                            )
+                            return
+                    else:
+                        service = cast("_SVC", self._service)
+                    self._resolved_endpoints = self._resolve_endpoints(service)
+                    await send({"type": "lifespan.startup.complete"})
+                case "lifespan.shutdown":
+                    if service_iter is not None:
+                        try:
+                            await service_iter.aclose()
+                        except Exception as e:  # noqa: BLE001 # invoking user callback
+                            await send(
+                                {"type": "lifespan.shutdown.failed", "message": str(e)}
+                            )
+                            return
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+
+    async def _handle_request(
+        self,
+        scope: HTTPScope,
+        receive: ASGIReceiveCallable,
+        send: ASGISendCallable,
+        endpoints: Mapping[str, Endpoint],
+    ) -> None:
         loop = _current_loop()
         receiver = _RequestReceiver(receive, loop.event())
         sender = _ResponseSender(send)
         ctx: RequestContext | None = None
         protocol: ServerProtocol | None = None
-        deadline: float | None = None
+        metadata_run: MetadataInterceptorsRun | None = None
+        unary: _UnaryResponse | None = None
+        stream: _StreamResponse | None = None
+        response_data: object = None
+        error: Exception | None = None
+        cancelled = False
+        cleanup: AbstractContextManager[object] = contextlib.nullcontext()
         try:
-            path = scope["path"]
-            endpoint = endpoints.get(path)
-            if not endpoint and scope["root_path"]:
-                # The application was mounted at some root so try stripping the prefix.
-                path = path.removeprefix(scope["root_path"])
-                endpoint = endpoints.get(path)
-            if not endpoint:
-                raise HTTPError(HTTPStatus.NOT_FOUND, [])
+            # The request's deadline, once known, covers everything up to its
+            # status, including on_end and writing a unary response. A timeout
+            # or a disconnect before then becomes the status, which is written
+            # without a deadline; a timeout after that is left to the server.
+            async with (timeout := loop.timeout_at(None)):
+                try:
+                    path = scope["path"]
+                    endpoint = endpoints.get(path)
+                    if not endpoint and scope["root_path"]:
+                        # The application was mounted at some root so try stripping the prefix.
+                        path = path.removeprefix(scope["root_path"])
+                        endpoint = endpoints.get(path)
+                    if not endpoint:
+                        raise HTTPError(HTTPStatus.NOT_FOUND, [])
 
-            http_method = scope["method"]
-            http_scheme = scope.get("scheme", "http")
-            headers = _process_headers(scope.get("headers", ()))
-            client_address = f"{ca[0]}:{ca[1]}" if (ca := scope.get("client")) else None
+                    http_method = scope["method"]
+                    http_scheme = scope.get("scheme", "http")
+                    headers = _process_headers(scope.get("headers", ()))
+                    client_address = (
+                        f"{ca[0]}:{ca[1]}" if (ca := scope.get("client")) else None
+                    )
 
-            content_type = headers.get("content-type", "")
-            protocol = negotiate_server_protocol(content_type)
-            if protocol.uses_trailers() and "http.response.trailers" not in cast(
-                "dict", scope.get("extensions", {})
-            ):
-                msg = f"ASGI server does not support ASGI trailers extension but protocol for content-type '{content_type}' requires trailers"
-                raise RuntimeError(msg)
+                    content_type = headers.get("content-type", "")
+                    protocol = negotiate_server_protocol(content_type)
+                    if (
+                        protocol.uses_trailers()
+                        and "http.response.trailers"
+                        not in cast("dict", scope.get("extensions", {}))
+                    ):
+                        msg = f"ASGI server does not support ASGI trailers extension but protocol for content-type '{content_type}' requires trailers"
+                        raise RuntimeError(msg)
 
-            ctx = protocol.create_request_context(
-                endpoint.method, http_method, http_scheme, headers, client_address
-            )
+                    ctx = protocol.create_request_context(
+                        endpoint.method,
+                        http_method,
+                        http_scheme,
+                        headers,
+                        client_address,
+                    )
+                    if (timeout_ms := ctx.timeout_ms) is not None:
+                        timeout.reschedule(loop.time() + timeout_ms / 1000)
 
-            if (timeout_ms := ctx.timeout_ms) is not None:
-                deadline = loop.time() + timeout_ms / 1000
-            else:
-                deadline = None
+                    is_unary = isinstance(endpoint, EndpointUnary)
 
-            is_unary = isinstance(endpoint, EndpointUnary)
+                    if http_method == "GET":
+                        query_string = scope.get("query_string", b"").decode("utf-8")
+                        query_params = parse_qs(query_string, keep_blank_values=True)
+                        codec_name = query_params.get("encoding", ("",))[0]
+                    else:
+                        query_params = _UNSET_QUERY_PARAMS
+                        codec_name = protocol.codec_name_from_content_type(
+                            headers.get("content-type", ""), stream=not is_unary
+                        )
+                    codec = self._codecs.get(codec_name)
+                    if not codec:
+                        raise HTTPError(
+                            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                            [("Accept-Post", "application/json, application/proto")],
+                        )
 
-            if http_method == "GET":
-                query_string = scope.get("query_string", b"").decode("utf-8")
-                query_params = parse_qs(query_string, keep_blank_values=True)
-                codec_name = query_params.get("encoding", ("",))[0]
-            else:
-                query_params = _UNSET_QUERY_PARAMS
-                codec_name = protocol.codec_name_from_content_type(
-                    headers.get("content-type", ""), stream=not is_unary
-                )
-            codec = self._codecs.get(codec_name)
-            if not codec:
-                raise HTTPError(
-                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                    [("Accept-Post", "application/json, application/proto")],
-                )
+                    metadata_run = MetadataInterceptorsRun(
+                        self._metadata_interceptors, ctx
+                    )
+                    if isinstance(endpoint, EndpointUnary) and isinstance(
+                        protocol, ConnectServerProtocol
+                    ):
+                        unary = _UnaryResponse(
+                            codec,
+                            negotiate_compression(
+                                headers.get("accept-encoding", ""), self._compressions
+                            ),
+                        )
+                        await metadata_run.start()
+                        request = await self._read_unary_request(
+                            http_method,
+                            headers,
+                            codec,
+                            query_params,
+                            endpoint,
+                            receiver,
+                        )
+                        async with loop.watch_for_disconnect(receiver, timeout):
+                            response_data = await endpoint.function(request, ctx)
+                    else:
+                        req_compression, resp_compression = (
+                            protocol.negotiate_stream_compression(
+                                headers, self._compressions
+                            )
+                        )
+                        stream = _StreamResponse(
+                            protocol,
+                            codec,
+                            resp_compression,
+                            protocol.create_envelope_writer(codec, resp_compression),
+                        )
+                        await metadata_run.start()
+                        if not req_compression:
+                            raise unknown_compression_error(
+                                headers.get(protocol.compression_header_name(), ""),
+                                self._compressions,
+                            )
+                        stream.request_stream = _request_stream(
+                            receiver,
+                            endpoint.method.input,
+                            codec,
+                            req_compression,
+                            self._read_max_bytes,
+                            loop,
+                        )
+                        # Once the request has been fully read, watch receive() for
+                        # a client disconnect so a handler that is blocked or still
+                        # streaming is stopped promptly. The handler's generator is
+                        # closed within the watch's scope.
+                        async with loop.watch_for_disconnect(
+                            receiver, timeout
+                        ) as disconnected:
+                            await self._stream_responses(
+                                endpoint,
+                                stream,
+                                metadata_run,
+                                disconnected,
+                                sender,
+                                loop,
+                                ctx,
+                            )
+                except Exception as e:  # noqa: BLE001 # invoking user callback
+                    error = e
+                if metadata_run is not None:
+                    # End the run before sending the response so on_end can still
+                    # modify response metadata. A no-op if the run already ended.
+                    error = await metadata_run.end(error)
+                if error is None and unary is not None:
+                    assert ctx is not None  # noqa: S101 # set before unary
+                    await unary.send(sender, response_data, ctx)
+        except TimeoutError as e:
+            error = _timeout_error(timeout, receiver, e)
+        except BaseException as e:
+            if loop.is_cancellation(e):
+                # Save the error for sending to the client, then let the cancellation reach the
+                # app server.
+                error = ConnectError(Code.CANCELED, "Request was cancelled")
+                cancelled = True
+                cleanup = loop.async_cleanup()
+            raise
+        finally:
+            try:
+                with cleanup:
+                    if metadata_run is not None:
+                        # A no-op unless the deadline or a cancellation cut the run
+                        # short.
+                        error = await metadata_run.end(error)
+                    # The status is written without a deadline. After a
+                    # cancellation it is best effort: the connection may be gone,
+                    # and the cancellation matters more than the send's error.
+                    with (
+                        contextlib.suppress(Exception)
+                        if cancelled
+                        else contextlib.nullcontext()
+                    ):
+                        if stream is not None:
+                            assert ctx is not None  # noqa: S101 # set before stream
+                            responded = await stream.end(sender, error, ctx)
+                        elif error is not None:
+                            responded = await self._handle_error(
+                                error, ctx, protocol, sender
+                            )
+                        else:
+                            responded = True
+            finally:
+                if stream is not None and stream.request_stream is not None:
+                    await stream.request_stream.aclose()
+        # Outside the finally, so that it does not replace a cancellation in flight.
+        if error is not None and (
+            not responded or not isinstance(error, (ConnectError, HTTPError))
+        ):
+            raise error
 
-            if is_unary and isinstance(protocol, ConnectServerProtocol):
-                return await self._handle_unary_connect(
-                    http_method,
-                    headers,
-                    codec,
-                    query_params,
-                    endpoint,
-                    receiver,
-                    sender,
-                    loop,
-                    deadline,
-                    ctx,
-                )
-        except Exception as e:
-            responded = await self._handle_error(e, ctx, protocol, sender)
-            if not responded or not isinstance(e, (ConnectError, HTTPError)):
-                raise
-            return None
-
-        # Streams have their own error handling so move out of the try block.
-        return await self._handle_stream(
-            receiver, sender, protocol, endpoint, codec, headers, loop, deadline, ctx
-        )
-
-    async def _handle_unary_connect(
+    async def _read_unary_request(
         self,
         http_method: str,
         headers: Headers,
@@ -353,68 +562,13 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         query_params: dict[str, list[str]],
         endpoint: EndpointUnary[_REQ, _RES],
         receive: _RequestReceiver,
-        send: _ResponseSender,
-        loop: AsyncioLoop | TrioLoop,
-        deadline: float | None,
-        ctx: RequestContext,
-    ) -> None:
-        accept_encoding = headers.get("accept-encoding", "")
-        compression = negotiate_compression(accept_encoding, self._compressions)
-
-        metadata_run = MetadataInterceptorsRun(self._metadata_interceptors, ctx)
-        response_data: _RES | None = None
-        error: Exception | None = None
-        try:
-            # The deadline covers everything up to the response's status,
-            # including on_end and writing a successful response. A timeout
-            # before the response has started becomes its status, which is then
-            # written without a deadline; one after that is left to the server.
-            async with (timeout := loop.timeout_at(deadline)):
-                try:
-                    await metadata_run.start()
-                    if http_method == "GET":
-                        request = await self._read_get_request(
-                            endpoint, codec, query_params
-                        )
-                        # There is no body to read before watching for a disconnect.
-                        receive.body_done.set()
-                    else:
-                        request = await self._read_post_request(
-                            endpoint, receive, codec, headers
-                        )
-                    async with loop.watch_for_disconnect(receive, timeout):
-                        response_data = await endpoint.function(request, ctx)
-                except Exception as e:  # noqa: BLE001 # invoking user callback
-                    error = e
-                # End the run before sending the response so on_end can still
-                # modify response metadata.
-                error = await metadata_run.end(error)
-                if error is None:
-                    assert response_data is not None  # noqa: S101 # no error means function returned
-                    await _send_unary_response(
-                        send, response_data, codec, compression, ctx
-                    )
-        except TimeoutError as e:
-            error = _timeout_error(timeout, receive, e)
-        except BaseException as e:
-            if loop.is_cancellation(e):
-                # Save the error for sending to the client, then let the cancellation reach the
-                # app server.
-                with loop.async_cleanup():
-                    error = await metadata_run.end(
-                        ConnectError(Code.CANCELED, "Request was cancelled")
-                    )
-                    assert error is not None  # noqa: S101
-                    # Best effort: the connection may be gone, and the
-                    # cancellation matters more than the send's error.
-                    with contextlib.suppress(Exception):
-                        await self._handle_error(error, ctx, None, send)
-            raise
-        finally:
-            # A no-op unless the deadline cut the run short.
-            error = await metadata_run.end(error)
-        if error is not None:
-            raise error
+    ) -> _REQ:
+        if http_method == "GET":
+            request = await self._read_get_request(endpoint, codec, query_params)
+            # There is no body to read before watching for a disconnect.
+            receive.body_done.set()
+            return request
+        return await self._read_post_request(endpoint, receive, codec, headers)
 
     async def _read_get_request(
         self,
@@ -489,124 +643,19 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
 
         return decode_message(codec, req_body, endpoint.method.input)
 
-    async def _handle_stream(
-        self,
-        receive: _RequestReceiver,
-        send: _ResponseSender,
-        protocol: ServerProtocol,
-        endpoint: Endpoint[_REQ, _RES],
-        codec: Codec,
-        headers: Headers,
-        loop: AsyncioLoop | TrioLoop,
-        deadline: float | None,
-        ctx: _server_shared.RequestContext,
-    ) -> None:
-        req_compression, resp_compression = protocol.negotiate_stream_compression(
-            headers, self._compressions
-        )
-
-        writer = protocol.create_envelope_writer(codec, resp_compression)
-
-        metadata_run = MetadataInterceptorsRun(self._metadata_interceptors, ctx)
-        error: Exception | None = None
-        cleanup: AbstractContextManager[object] = contextlib.nullcontext()
-        request_stream: AsyncGenerator[_REQ] | None = None
-        try:
-            # The deadline covers everything up to the end of the stream,
-            # including on_end. A timeout before then becomes the stream's
-            # error, and the end of the stream is written without a deadline.
-            async with (timeout := loop.timeout_at(deadline)):
-                try:
-                    await metadata_run.start()
-                    if not req_compression:
-                        raise unknown_compression_error(
-                            headers.get(protocol.compression_header_name(), ""),
-                            self._compressions,
-                        )
-                    request_stream = _request_stream(
-                        receive,
-                        endpoint.method.input,
-                        codec,
-                        req_compression,
-                        self._read_max_bytes,
-                        loop,
-                    )
-
-                    # Once the request has been fully read, watch receive() for a
-                    # client disconnect so a handler that is blocked or still
-                    # streaming is stopped promptly. The handler's generator is
-                    # closed within the watch's scope.
-                    async with loop.watch_for_disconnect(
-                        receive, timeout
-                    ) as disconnected:
-                        await self._stream_responses(
-                            endpoint,
-                            request_stream,
-                            metadata_run,
-                            disconnected,
-                            send,
-                            protocol,
-                            codec,
-                            resp_compression,
-                            writer,
-                            loop,
-                            ctx,
-                        )
-                except Exception as e:  # noqa: BLE001 # invoking user callback
-                    error = e
-                # End the run before ending the response so on_end can still
-                # modify response trailers. A no-op if the run already ended.
-                error = await metadata_run.end(error)
-        except TimeoutError as e:
-            error = _timeout_error(timeout, receive, e)
-        except BaseException as e:
-            if loop.is_cancellation(e):
-                # Save the error for sending to the client, then let the cancellation reach the
-                # app server.
-                error = ConnectError(Code.CANCELED, "Request was cancelled")
-                cleanup = loop.async_cleanup()
-            raise
-        finally:
-            try:
-                with cleanup:
-                    # A no-op unless the deadline or a cancellation cut the run
-                    # short.
-                    error = await metadata_run.end(error)
-                    # A failed send can't be followed by the end of the response,
-                    # and its error is reported below or by the server.
-                    if not send.failed:
-                        if not send.started:
-                            # Exception before any response message is returned
-                            await _send_stream_response_headers(
-                                send, protocol, codec, resp_compression.name(), ctx
-                            )
-                        end_message = writer.end(
-                            ctx.response_trailers,
-                            ConnectWireError.from_exception(error) if error else None,
-                        )
-                        await _send_stream_end(send, end_message)
-            finally:
-                if request_stream is not None:
-                    await request_stream.aclose()
-        # Outside the finally, so that it does not replace a cancellation in flight.
-        if error and not isinstance(error, ConnectError):
-            raise error
-
     async def _stream_responses(
         self,
         endpoint: Endpoint[_REQ, _RES],
-        request_stream: AsyncGenerator[_REQ],
+        stream: _StreamResponse,
         metadata_run: MetadataInterceptorsRun,
         disconnected: Callable[[], bool] | None,
         send: _ResponseSender,
-        protocol: ServerProtocol,
-        codec: Codec,
-        resp_compression: Compression,
-        writer: EnvelopeWriter,
         loop: AsyncioLoop | TrioLoop,
         ctx: RequestContext,
     ) -> None:
         """Invoke the handler and send its response messages."""
+        request_stream = stream.request_stream
+        assert request_stream is not None  # noqa: S101 # created before the handler
         match endpoint:
             case EndpointUnary():
                 request = await _consume_single_request(request_stream)
@@ -636,11 +685,9 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                 # Don't send headers until the first message to allow logic a
                 # chance to add response headers.
                 if not send.started:
-                    await _send_stream_response_headers(
-                        send, protocol, codec, resp_compression.name(), ctx
-                    )
+                    await stream.send_headers(send, ctx)
 
-                body = writer.write(message)
+                body = stream.writer.write(message)
                 await send(
                     {"type": "http.response.body", "body": body, "more_body": True}
                 )
@@ -801,30 +848,6 @@ def _current_loop() -> AsyncioLoop | TrioLoop:
     return _ASYNCIO_LOOP
 
 
-async def _send_stream_response_headers(
-    send: ASGISendCallable,
-    protocol: ServerProtocol,
-    codec: Codec,
-    compression_name: str,
-    ctx: RequestContext,
-) -> None:
-    response_headers = [
-        (b"content-type", protocol.content_type(codec).encode()),
-        (protocol.compression_header_name().encode(), compression_name.encode()),
-    ]
-    response_headers.extend(
-        (key.encode(), value.encode()) for key, value in ctx.response_headers.allitems()
-    )
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 200,
-            "headers": response_headers,
-            "trailers": protocol.uses_trailers(),
-        }
-    )
-
-
 def _timeout_error(
     timeout: Timeout | TrioTimeout, receive: _RequestReceiver, error: TimeoutError
 ) -> Exception:
@@ -842,50 +865,6 @@ def _timeout_error(
         result = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
     result.__cause__ = error
     return result
-
-
-async def _send_unary_response(
-    send: _ResponseSender,
-    response_data: _RES,
-    codec: Codec,
-    compression: Compression,
-    ctx: RequestContext,
-) -> None:
-    res_bytes = compression.compress(codec.encode(response_data))
-    response_headers: list[tuple[bytes, bytes]] = [
-        (
-            b"content-type",
-            f"{CONNECT_UNARY_CONTENT_TYPE_PREFIX}{codec.name()}".encode(),
-        ),
-        (b"content-encoding", compression.name().encode()),
-        (b"vary", b"Accept-Encoding"),
-    ]
-    _add_context_headers(response_headers, ctx)
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 200,
-            "headers": response_headers,
-            "trailers": False,
-        }
-    )
-    await send({"type": "http.response.body", "body": res_bytes, "more_body": False})
-
-
-async def _send_stream_end(send: _ResponseSender, end_message: bytes | Headers) -> None:
-    if isinstance(end_message, bytes):
-        await send(
-            {"type": "http.response.body", "body": end_message, "more_body": False}
-        )
-        return
-    await send({"type": "http.response.body", "body": b"", "more_body": False})
-    await send(
-        {
-            "type": "http.response.trailers",
-            "headers": [(k.encode(), v.encode()) for k, v in end_message.allitems()],
-            "more_trailers": False,
-        }
-    )
 
 
 async def _close_response_stream(
