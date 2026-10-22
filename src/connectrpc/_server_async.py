@@ -7,11 +7,11 @@ import inspect
 from abc import ABC, abstractmethod
 from asyncio import (
     CancelledError,
-    Event,
     Timeout,
     create_task,
     get_running_loop,
     sleep,
+    timeout as asyncio_timeout,
     timeout_at as asyncio_timeout_at,
 )
 from dataclasses import replace
@@ -503,6 +503,8 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                 async with watch as disconnected:
                     try:
                         async for message in response_stream:
+                            # Only a watch that can't cancel the handler yields a
+                            # flag to poll.
                             if disconnected is not None and disconnected():
                                 raise ConnectError(Code.CANCELED, "Client disconnected")
                             # Don't send headers until the first message to allow logic a
@@ -682,24 +684,37 @@ class AsyncioLoop:
     @contextlib.asynccontextmanager
     async def watch_for_disconnect(
         self, receive: ASGIReceiveCallable
-    ) -> AsyncGenerator[Callable[[], bool]]:
-        """Watch receive() for a client disconnect."""
-        disconnected = Event()
+    ) -> AsyncGenerator[None]:
+        """Cancel the body with CANCELED when the client disconnects.
+
+        A handler blocked between messages is cancelled at its await, so the
+        body has nothing to poll and the watch yields None. asyncio delivers
+        the cancellation once, so the handler's cleanup still runs as normal.
+
+        This reads receive(), so only use it once the request body has been read.
+        """
+        scope = asyncio_timeout(None)
 
         async def watch() -> None:
             while True:
                 msg = await receive()
                 if msg["type"] == "http.disconnect":
-                    disconnected.set()
+                    scope.reschedule(get_running_loop().time())
                     return
 
-        task = create_task(watch())
         try:
-            yield disconnected.is_set
-        finally:
-            task.cancel()
-            with contextlib.suppress(CancelledError):
-                await task
+            async with scope:
+                task = create_task(watch())
+                try:
+                    yield
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(CancelledError):
+                        await task
+        except TimeoutError as e:
+            if scope.expired():
+                raise ConnectError(Code.CANCELED, "Client disconnected") from e
+            raise
 
 
 _ASYNCIO_LOOP = AsyncioLoop()
