@@ -122,6 +122,11 @@ class TrioTimeout:
         """Move the deadline, like asyncio.Timeout.reschedule."""
         self._scope.deadline = when
 
+    def when(self) -> float | None:
+        """Return the deadline, like asyncio.Timeout.when."""
+        deadline = self._scope.deadline
+        return None if deadline == math.inf else deadline
+
     async def __aenter__(self) -> Self:
         self._scope.__enter__()
         return self

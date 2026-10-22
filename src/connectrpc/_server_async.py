@@ -503,7 +503,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     assert ctx is not None  # noqa: S101 # set before unary
                     await unary.send(sender, response_data, ctx)
         except TimeoutError as e:
-            error = _timeout_error(timeout, receiver, loop, deadline, e)
+            error = _timeout_error(timeout, receiver, deadline, e)
         except BaseException as e:
             if loop.is_cancellation(e):
                 # Save the error for sending to the client, then let the cancellation reach the
@@ -887,19 +887,20 @@ def _current_loop() -> AsyncioLoop | TrioLoop:
 def _timeout_error(
     timeout: Timeout | TrioTimeout,
     receive: _RequestReceiver,
-    loop: AsyncioLoop | TrioLoop,
     deadline: float | None,
     error: TimeoutError,
 ) -> Exception:
     """Return the error for a TimeoutError raised out of the request's scope.
 
     The scope is cut short by the deadline or, before it, by a client
-    disconnect. The run catches its hooks' exceptions, so any other
+    disconnect, which the watch reports by moving the scope's deadline up to
+    the disconnect. The run catches its hooks' exceptions, so any other
     TimeoutError was raised by a send and is reported as is.
     """
     if not timeout.expired():
         return error
-    if receive.disconnected and (deadline is None or loop.time() < deadline):
+    when = timeout.when()
+    if receive.disconnected and (deadline is None or when is None or when < deadline):
         result = ConnectError(Code.CANCELED, "Client disconnected")
     else:
         result = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")

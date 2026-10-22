@@ -862,6 +862,14 @@ async def test_client_disconnects_as_deadline_fires() -> None:
     scope = _make_similar_hats_scope()
     scope["headers"] = [*scope["headers"], (b"connect-timeout-ms", b"20")]
 
+    # Give the loop the clock of Windows before Python 3.13, which advances in
+    # steps of about 16ms: the deadline then fires while the clock still reads
+    # before it, so the outcome can't be decided by reading the clock.
+    loop = asyncio.get_running_loop()
+    resolution = loop._clock_resolution = 0.0156
+    real_time = loop.time
+    loop.time = lambda: real_time() // resolution * resolution
+
     await asyncio.wait_for(app(scope, receive, send), timeout=1.0)
 
     assert events == ["handler cleaned up", "on_end deadline_exceeded"]
