@@ -378,9 +378,10 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         cleanup: AbstractContextManager[object] = contextlib.nullcontext()
         try:
             # The request's deadline, once known, covers everything up to its
-            # status, including on_end and writing a unary response. A timeout
-            # or a disconnect before then becomes the status, which is written
-            # without a deadline; a timeout after that is left to the server.
+            # status, including writing the full unary response of end-of-stream
+            # message. A timeout or a disconnect before then becomes the status,
+            # which is written without a deadline. A timeout after that is left
+            # to the server as it is too late for us to be able to do anything.
             async with (timeout := loop.timeout_at(None)):
                 try:
                     path = scope["path"]
@@ -525,8 +526,8 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             try:
                 with cleanup:
                     if metadata_run is not None:
-                        # A no-op unless the deadline or a cancellation cut the run
-                        # short.
+                        # A no-op unless the deadline or a cancellation prevented
+                        # any from running.
                         error = await metadata_run.end(error)
                     # The status is written without a deadline. After a
                     # cancellation it is best effort: the connection may be gone,
