@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
     from asgiref.typing import ASGIReceiveCallable
 
+    from ._server_async import _Event
+
 # Seconds allowed for each cleanup step that runs after a cancellation: closing
 # the handler's generator, then the on_end hooks and the end of the response. A
 # cancelled request therefore delays the app server by at most twice this. The
@@ -35,6 +37,9 @@ class TrioLoop:
 
     def time(self) -> float:
         return trio.current_time()
+
+    def event(self) -> _Event:
+        return trio.Event()
 
     def timeout_at(self, deadline: float | None) -> TrioTimeout:
         return TrioTimeout(deadline)
@@ -59,11 +64,16 @@ class TrioLoop:
 
     @contextlib.asynccontextmanager
     async def watch_for_disconnect(
-        self, receive: ASGIReceiveCallable
+        self, receive: ASGIReceiveCallable, body_done: _Event
     ) -> AsyncGenerator[Callable[[], bool]]:
+        # The watch yields a flag for the body to poll instead of cancelling it:
+        # trio raises Cancelled at every checkpoint of a cancelled scope, which
+        # would cut short a handler's unshielded async cleanup, while a poll
+        # closes the handler's generator normally.
         disconnected = trio.Event()
 
         async def watch() -> None:
+            await body_done.wait()
             # An error raised in a nursery cancels the rest of it, so an error
             # from receive() would end the response.
             with contextlib.suppress(Exception):

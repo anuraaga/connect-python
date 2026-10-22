@@ -364,9 +364,14 @@ class EndlessHats(Haberdasher):
     async def make_various_hats(
         self, request: AsyncIterator[Size], _ctx: RequestContext[Size, Hat], /
     ) -> AsyncIterator[Hat]:
+        # Reads the whole request, then streams like make_similar_hats.
         try:
-            async for size in request:
+            size = Size()
+            async for message in request:
+                size = message
+            while True:
                 yield Hat(size=size.inches)
+                await trio.sleep(0.01)
         finally:
             await self._clean_up()
 
@@ -377,18 +382,22 @@ class EndlessHats(Haberdasher):
             raise self._cleanup_error
 
 
-def read_hats_then_disconnect(url: str) -> None:
+def read_hats_then_disconnect(url: str, method: str = "MakeSimilarHats") -> None:
     # The client's own connection, so that closing it disconnects the request.
     with (
         SyncHTTPTransport(http_version=HTTPVersion.HTTP1) as transport,
         HaberdasherClientSync(url, http_client=SyncClient(transport)) as client,
     ):
-        hats = client.make_similar_hats(Size(inches=10))
+        if method == "MakeSimilarHats":
+            hats = client.make_similar_hats(Size(inches=10))
+        else:
+            hats = client.make_various_hats(iter([Size(inches=10)]))
         assert [next(hats).size for _ in range(3)] == [10, 10, 10]
         del hats
     gc.collect()
 
 
+@pytest.mark.parametrize("method", ["MakeSimilarHats", "MakeVariousHats"])
 @pytest.mark.parametrize(
     ("cleanup_error", "end_error"),
     [
@@ -400,17 +409,19 @@ def read_hats_then_disconnect(url: str) -> None:
     ],
     ids=["clean", "cleanup-error"],
 )
-def test_disconnect_ends_server_stream(
+def test_disconnect_ends_stream(
     url: str,
     wrapper: Wrapper,
+    method: str,
     cleanup_error: Exception | None,
     end_error: dict[str, str],
 ) -> None:
+    """A disconnect after the request has been read ends the response stream."""
     events: list[str] = []
     wrapper.app = HaberdasherASGIApplication(
         EndlessHats(events, cleanup_error), interceptors=[Recorder(events)]
     )
-    read_hats_then_disconnect(url)
+    read_hats_then_disconnect(url, method)
 
     assert wrapper.done.wait(10)
     assert wrapper.end_error() == end_error

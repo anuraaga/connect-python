@@ -7,6 +7,8 @@ import inspect
 from abc import ABC, abstractmethod
 from asyncio import (
     CancelledError,
+    Event,
+    Task,
     Timeout,
     create_task,
     get_running_loop,
@@ -16,7 +18,7 @@ from asyncio import (
 )
 from dataclasses import replace
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, cast
 from urllib.parse import parse_qs
 
 from ._codec import Codec, get_default_codecs
@@ -58,14 +60,21 @@ if TYPE_CHECKING:
     from collections.abc import (
         AsyncGenerator,
         AsyncIterator,
+        Awaitable,
         Callable,
         Iterable,
         Mapping,
         Sequence,
     )
-    from contextlib import AbstractAsyncContextManager, AbstractContextManager
+    from contextlib import AbstractContextManager
 
-    from asgiref.typing import ASGIReceiveCallable, ASGISendCallable, HTTPScope, Scope
+    from asgiref.typing import (
+        ASGIReceiveCallable,
+        ASGISendCallable,
+        ASGISendEvent,
+        HTTPScope,
+        Scope,
+    )
 
     from . import _server_shared
     from ._server_trio import TrioLoop
@@ -92,6 +101,39 @@ Endpoint = (
     | EndpointServerStream[_REQ, _RES]
     | EndpointUnary[_REQ, _RES]
 )
+
+
+class _Event(Protocol):
+    """The loop's event: asyncio.Event or trio.Event."""
+
+    def set(self) -> None: ...
+
+    def wait(self) -> Awaitable[object]: ...
+
+
+class _ResponseSender:
+    """The request's send(), tracking whether the response started or failed.
+
+    A failed send means the server rejected the message or lost the connection,
+    so the response can't be completed and sending more would only raise again,
+    hiding the first error.
+    """
+
+    __slots__ = ("_send", "failed", "started")
+
+    def __init__(self, send: ASGISendCallable) -> None:
+        self._send = send
+        self.started = False
+        self.failed = False
+
+    async def __call__(self, message: ASGISendEvent) -> None:
+        try:
+            await self._send(message)
+        except Exception:
+            self.failed = True
+            raise
+        if message["type"] == "http.response.start":
+            self.started = True
 
 
 class ConnectASGIApplication(ABC, Generic[_SVC]):
@@ -198,6 +240,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         endpoints = self._resolved_endpoints
 
         loop = _current_loop()
+        sender = _ResponseSender(send)
         ctx: RequestContext | None = None
         protocol: ServerProtocol | None = None
         deadline: float | None = None
@@ -259,20 +302,20 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     query_params,
                     endpoint,
                     receive,
-                    send,
+                    sender,
                     loop,
                     deadline,
                     ctx,
                 )
         except Exception as e:
-            await self._handle_error(e, ctx, protocol, send)
+            await self._handle_error(e, ctx, protocol, sender)
             if not isinstance(e, (ConnectError, HTTPError)):
                 raise
             return None
 
         # Streams have their own error handling so move out of the try block.
         return await self._handle_stream(
-            receive, send, protocol, endpoint, codec, headers, loop, deadline, ctx
+            receive, sender, protocol, endpoint, codec, headers, loop, deadline, ctx
         )
 
     async def _handle_unary_connect(
@@ -283,7 +326,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         query_params: dict[str, list[str]],
         endpoint: EndpointUnary[_REQ, _RES],
         receive: ASGIReceiveCallable,
-        send: ASGISendCallable,
+        send: _ResponseSender,
         loop: AsyncioLoop | TrioLoop,
         deadline: float | None,
         ctx: RequestContext,
@@ -297,15 +340,18 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         try:
             async with (timeout := loop.timeout_at(deadline)):
                 await metadata_run.start()
+                body_done = loop.event()
                 if http_method == "GET":
                     request = await self._read_get_request(
                         endpoint, codec, query_params
                     )
+                    body_done.set()
                 else:
                     request = await self._read_post_request(
-                        endpoint, receive, codec, headers
+                        endpoint, receive, codec, headers, body_done
                     )
-                response_data = await endpoint.function(request, ctx)
+                async with loop.watch_for_disconnect(receive, body_done):
+                    response_data = await endpoint.function(request, ctx)
         except TimeoutError as e:
             if timeout.expired():
                 error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
@@ -323,7 +369,10 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                         ConnectError(Code.CANCELED, "Request was cancelled")
                     )
                     assert error is not None  # noqa: S101
-                    await self._handle_error(error, ctx, None, send)
+                    # Best effort: the connection may be gone, and the
+                    # cancellation matters more than the send's error.
+                    with contextlib.suppress(Exception):
+                        await self._handle_error(error, ctx, None, send)
             raise
         finally:
             # End the run before sending the response so on_end can still modify
@@ -405,12 +454,13 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         receive: ASGIReceiveCallable,
         codec: Codec,
         headers: Headers,
+        body_done: _Event,
     ) -> _REQ:
         """Handle POST request with body."""
         # Get request body
         chunks: list[bytes] = []
         read_bytes = 0
-        async for chunk in _read_body(receive):
+        async for chunk in _read_body(receive, body_done):
             read_bytes += len(chunk)
             if self._read_max_bytes is not None and read_bytes > self._read_max_bytes:
                 raise ConnectError(
@@ -434,7 +484,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
     async def _handle_stream(
         self,
         receive: ASGIReceiveCallable,
-        send: ASGISendCallable,
+        send: _ResponseSender,
         protocol: ServerProtocol,
         endpoint: Endpoint[_REQ, _RES],
         codec: Codec,
@@ -452,7 +502,6 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         metadata_run = MetadataInterceptorsRun(self._metadata_interceptors, ctx)
         error: Exception | None = None
         cleanup: AbstractContextManager[object] = contextlib.nullcontext()
-        sent_headers = False
         request_stream: AsyncGenerator[_REQ] | None = None
         try:
             async with (timeout := loop.timeout_at(deadline)):
@@ -462,6 +511,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                         headers.get(protocol.compression_header_name(), ""),
                         self._compressions,
                     )
+                body_done = loop.event()
                 request_stream = _request_stream(
                     receive,
                     endpoint.method.input,
@@ -469,38 +519,36 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     req_compression,
                     self._read_max_bytes,
                     loop,
+                    body_done,
                 )
 
-                watch: AbstractAsyncContextManager[Callable[[], bool] | None] = (
-                    contextlib.nullcontext(None)
-                )
+                # Once the request has been fully read, watch receive() for a client
+                # disconnect so a handler that is blocked or still streaming is
+                # stopped promptly. The handler's generator is closed within the
+                # watch's scope.
+                async with loop.watch_for_disconnect(
+                    receive, body_done
+                ) as disconnected:
+                    match endpoint:
+                        case EndpointUnary():
+                            request = await _consume_single_request(request_stream)
+                            response = await endpoint.function(request, ctx)
+                            # End the run before sending the response so on_end can
+                            # still modify response metadata.
+                            if (end_error := await metadata_run.end(None)) is not None:
+                                raise end_error
+                            response_stream = _yield_single_response(response)
+                        case EndpointClientStream():
+                            response = await endpoint.function(request_stream, ctx)
+                            if (end_error := await metadata_run.end(None)) is not None:
+                                raise end_error
+                            response_stream = _yield_single_response(response)
+                        case EndpointServerStream():
+                            request = await _consume_single_request(request_stream)
+                            response_stream = endpoint.function(request, ctx)
+                        case EndpointBidiStream():
+                            response_stream = endpoint.function(request_stream, ctx)
 
-                match endpoint:
-                    case EndpointUnary():
-                        request = await _consume_single_request(request_stream)
-                        response = await endpoint.function(request, ctx)
-                        # End the run before sending the response so on_end can still
-                        # modify response metadata.
-                        if (end_error := await metadata_run.end(None)) is not None:
-                            raise end_error
-                        response_stream = _yield_single_response(response)
-                    case EndpointClientStream():
-                        response = await endpoint.function(request_stream, ctx)
-                        if (end_error := await metadata_run.end(None)) is not None:
-                            raise end_error
-                        response_stream = _yield_single_response(response)
-                    case EndpointServerStream():
-                        request = await _consume_single_request(request_stream)
-                        response_stream = endpoint.function(request, ctx)
-
-                        # The request has been fully consumed; monitor receive() for a
-                        # client disconnect so we can stop streaming promptly.
-                        watch = loop.watch_for_disconnect(receive)
-                    case EndpointBidiStream():
-                        response_stream = endpoint.function(request_stream, ctx)
-
-                # Make sure the generator is closed within the watcher's scope.
-                async with watch as disconnected:
                     try:
                         async for message in response_stream:
                             # Only a watch that can't cancel the handler yields a
@@ -509,11 +557,10 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                                 raise ConnectError(Code.CANCELED, "Client disconnected")
                             # Don't send headers until the first message to allow logic a
                             # chance to add response headers.
-                            if not sent_headers:
+                            if not send.started:
                                 await _send_stream_response_headers(
                                     send, protocol, codec, resp_compression.name(), ctx
                                 )
-                                sent_headers = True
 
                             body = writer.write(message)
                             await send(
@@ -549,41 +596,19 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     # modify response trailers. This is a no-op if the run already
                     # ended.
                     error = await metadata_run.end(error)
-                    end_message = writer.end(
-                        ctx.response_trailers,
-                        ConnectWireError.from_exception(error) if error else None,
-                    )
-                    if not sent_headers:
-                        # Exception before any response message is returned
-                        await _send_stream_response_headers(
-                            send, protocol, codec, resp_compression.name(), ctx
+                    # A failed send can't be followed by the end of the response,
+                    # and its error is reported below or by the server.
+                    if not send.failed:
+                        if not send.started:
+                            # Exception before any response message is returned
+                            await _send_stream_response_headers(
+                                send, protocol, codec, resp_compression.name(), ctx
+                            )
+                        end_message = writer.end(
+                            ctx.response_trailers,
+                            ConnectWireError.from_exception(error) if error else None,
                         )
-                    if isinstance(end_message, bytes):
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": end_message,
-                                "more_body": False,
-                            }
-                        )
-                    else:
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": b"",
-                                "more_body": False,
-                            }
-                        )
-                        await send(
-                            {
-                                "type": "http.response.trailers",
-                                "headers": [
-                                    (k.encode(), v.encode())
-                                    for k, v in end_message.allitems()
-                                ],
-                                "more_trailers": False,
-                            }
-                        )
+                        await _send_stream_end(send, end_message)
             finally:
                 if request_stream is not None:
                     await request_stream.aclose()
@@ -596,9 +621,12 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         exc: Exception,
         ctx: RequestContext | None,
         protocol: ServerProtocol | None,
-        send: ASGISendCallable,
+        send: _ResponseSender,
     ) -> None:
         """Handle errors that occur during request processing."""
+        if send.started:
+            # The error came from sending the response, which can't be replaced.
+            return
         headers: list[tuple[bytes, bytes]]
         body: bytes
         status: int
@@ -664,6 +692,10 @@ class AsyncioLoop:
         """Return the loop's clock, which deadlines are measured on."""
         return get_running_loop().time()
 
+    def event(self) -> _Event:
+        """Return an event of the loop."""
+        return Event()
+
     def timeout_at(self, deadline: float | None) -> Timeout:
         """Return a context whose body raises TimeoutError once the deadline passes.
 
@@ -683,34 +715,49 @@ class AsyncioLoop:
 
     @contextlib.asynccontextmanager
     async def watch_for_disconnect(
-        self, receive: ASGIReceiveCallable
+        self, receive: ASGIReceiveCallable, body_done: _Event
     ) -> AsyncGenerator[None]:
         """Cancel the body with CANCELED when the client disconnects.
 
-        A handler blocked between messages is cancelled at its await, so the
-        body has nothing to poll and the watch yields None. asyncio delivers
-        the cancellation once, so the handler's cleanup still runs as normal.
+        A handler blocked at an await is cancelled there, so the body has
+        nothing to poll and the watch yields None. asyncio delivers the
+        cancellation once, so the handler's cleanup still runs as normal.
 
-        This reads receive(), so only use it once the request body has been read.
+        A disconnect is only delivered by receive(), which also delivers the
+        request body, so the watch starts reading once body_done is set.
         """
         scope = asyncio_timeout(None)
+        task: Task[None] | None = None
 
         async def watch() -> None:
-            while True:
-                msg = await receive()
-                if msg["type"] == "http.disconnect":
-                    scope.reschedule(get_running_loop().time())
-                    return
+            await body_done.wait()
+            # An error from receive() would otherwise replace the response's
+            # outcome when the watch ends.
+            with contextlib.suppress(Exception):
+                while True:
+                    msg = await receive()
+                    if msg["type"] == "http.disconnect":
+                        scope.reschedule(get_running_loop().time())
+                        return
+
+        def start() -> None:
+            nonlocal task
+            task = create_task(watch())
 
         try:
             async with scope:
-                task = create_task(watch())
+                # Only a body that suspends can be cancelled, so start the watch
+                # from the loop, which runs once the body suspends. A body that
+                # completes without suspending never pays for the task.
+                handle = get_running_loop().call_soon(start)
                 try:
                     yield
                 finally:
-                    task.cancel()
-                    with contextlib.suppress(CancelledError):
-                        await task
+                    handle.cancel()
+                    if task is not None:
+                        task.cancel()
+                        with contextlib.suppress(CancelledError):
+                            await task
         except TimeoutError as e:
             if scope.expired():
                 raise ConnectError(Code.CANCELED, "Client disconnected") from e
@@ -755,6 +802,22 @@ async def _send_stream_response_headers(
     )
 
 
+async def _send_stream_end(send: _ResponseSender, end_message: bytes | Headers) -> None:
+    if isinstance(end_message, bytes):
+        await send(
+            {"type": "http.response.body", "body": end_message, "more_body": False}
+        )
+        return
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+    await send(
+        {
+            "type": "http.response.trailers",
+            "headers": [(k.encode(), v.encode()) for k, v in end_message.allitems()],
+            "more_trailers": False,
+        }
+    )
+
+
 async def _close_response_stream(
     stream: AsyncIterator[object],
     loop: AsyncioLoop | TrioLoop,
@@ -775,8 +838,9 @@ async def _request_stream(
     compression: Compression,
     read_max_bytes: int | None,
     loop: AsyncioLoop | TrioLoop,
+    body_done: _Event,
 ) -> AsyncGenerator[_REQ]:
-    body = _read_body(receive)
+    body = _read_body(receive, body_done)
     try:
         with EnvelopeReader(
             request_class, codec, compression, read_max_bytes
@@ -791,16 +855,20 @@ async def _request_stream(
         await _aclose(body)
 
 
-async def _read_body(receive: ASGIReceiveCallable) -> AsyncIterator[bytes]:
-    """Read the body of the request."""
+async def _read_body(
+    receive: ASGIReceiveCallable, body_done: _Event
+) -> AsyncIterator[bytes]:
+    """Read the body of the request, setting body_done once it has all been read."""
     while True:
         message = await receive()
         match message["type"]:
             case "http.request":
                 body = message.get("body", b"")
-                yield body
                 if not message.get("more_body", False):
+                    body_done.set()
+                    yield body
                     return
+                yield body
             case "http.disconnect":
                 raise ConnectError(
                     Code.CANCELED, "Client disconnected before request completion"
