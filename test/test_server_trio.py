@@ -751,6 +751,25 @@ def test_on_end_after_cancellation_is_bounded(
 
 
 @pytest.mark.parametrize("method", ["MakeHat", "MakeSimilarHats"])
+def test_on_end_is_bounded_by_deadline(
+    client: HaberdasherClientSync, wrapper: Wrapper, method: str
+) -> None:
+    events: list[str] = []
+    wrapper.app = HaberdasherASGIApplication(
+        TrioHaberdasher(), interceptors=[Recorder(events, seconds=5)]
+    )
+
+    with pytest.raises(ConnectError) as exc_info:
+        call(client, method, headers={"connect-timeout-ms": "100"})
+    assert wrapper.done.wait(10)
+
+    assert exc_info.value.code == Code.DEADLINE_EXCEEDED
+    assert wrapper.raised is None
+    assert events == ["on_end started None"]
+    assert wrapper.error() == TIMED_OUT
+
+
+@pytest.mark.parametrize("method", ["MakeHat", "MakeSimilarHats"])
 def test_on_end_is_not_bounded_without_cancellation(
     client: HaberdasherClientSync, wrapper: Wrapper, cleanup_timeout: float, method: str
 ) -> None:

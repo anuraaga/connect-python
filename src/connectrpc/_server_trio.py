@@ -14,12 +14,11 @@ import trio
 import trio.lowlevel
 
 if TYPE_CHECKING:
+    from asyncio import Timeout
     from collections.abc import AsyncGenerator, Callable
     from types import TracebackType
 
-    from asgiref.typing import ASGIReceiveCallable
-
-    from ._server_async import _Event
+    from ._server_async import _Event, _RequestReceiver
 
 # Seconds allowed for each cleanup step that runs after a cancellation: closing
 # the handler's generator, then the on_end hooks and the end of the response. A
@@ -64,31 +63,29 @@ class TrioLoop:
 
     @contextlib.asynccontextmanager
     async def watch_for_disconnect(
-        self, receive: ASGIReceiveCallable, body_done: _Event
+        self, receive: _RequestReceiver, _scope: Timeout | TrioTimeout
     ) -> AsyncGenerator[Callable[[], bool]]:
-        # The watch yields a flag for the body to poll instead of cancelling it:
-        # trio raises Cancelled at every checkpoint of a cancelled scope, which
-        # would cut short a handler's unshielded async cleanup, while a poll
-        # closes the handler's generator normally.
-        disconnected = trio.Event()
-
+        # The watch yields a flag for the body to poll instead of cutting the
+        # deadline short: trio raises Cancelled at every checkpoint of a
+        # cancelled scope, which would cut short a handler's unshielded async
+        # cleanup, while a poll closes the handler's generator normally.
         async def watch() -> None:
-            await body_done.wait()
+            await receive.body_done.wait()
             # An error raised in a nursery cancels the rest of it, so an error
             # from receive() would end the response.
             with contextlib.suppress(Exception):
-                while True:
-                    msg = await receive()
-                    if msg["type"] == "http.disconnect":
-                        disconnected.set()
-                        return
+                while not receive.disconnected:
+                    await receive()
+
+        def disconnected() -> bool:
+            return receive.disconnected
 
         error: BaseException | None = None
         try:
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(watch)
                 try:
-                    yield disconnected.is_set
+                    yield disconnected
                 except BaseException as e:  # noqa: BLE001
                     # Raised after the nursery exits; raised inside, the nursery
                     # would wrap it in an ExceptionGroup.
@@ -120,6 +117,10 @@ class TrioTimeout:
     def expired(self) -> bool:
         """Whether the deadline passed while the body ran."""
         return self._scope.cancelled_caught
+
+    def reschedule(self, when: float) -> None:
+        """Move the deadline, like asyncio.Timeout.reschedule."""
+        self._scope.deadline = when
 
     async def __aenter__(self) -> Self:
         self._scope.__enter__()

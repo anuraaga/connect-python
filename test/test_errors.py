@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, NoReturn
 
@@ -39,6 +40,8 @@ from .connectrpc.example.haberdasher_pb import Hat, Size
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
+
+    from asgiref.typing import HTTPRequestEvent, HTTPScope
 
     from connectrpc.request import RequestContext
 
@@ -615,6 +618,8 @@ class _ErrorRecordingInterceptor:
         return None
 
     async def on_end(self, _token, _ctx, error: Exception | None) -> None:
+        # An on_end still gets to await after the deadline has passed.
+        await asyncio.sleep(0)
         self.errors.append(error)
 
 
@@ -678,6 +683,178 @@ async def test_async_server_timeout(protocol: ProtocolType, method: str) -> None
     assert isinstance(interceptor.errors[0], ConnectError)
     assert interceptor.errors[0].code == Code.DEADLINE_EXCEEDED
     assert transport.app_exception is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _protocols)
+@pytest.mark.parametrize("method", _blocking_methods)
+async def test_async_server_timeout_in_on_end(
+    protocol: ProtocolType, method: str
+) -> None:
+    """A slow on_end is bounded by the request's deadline like the handler is."""
+
+    class QuickHaberdasher(Haberdasher):
+        async def make_hat(self, request, _ctx) -> Hat:
+            return Hat(size=request.inches)
+
+        async def make_flexible_hat(self, request, _ctx) -> Hat:
+            async for _ in request:
+                pass
+            return Hat()
+
+        async def make_similar_hats(self, request, _ctx) -> AsyncIterator[Hat]:
+            yield Hat(size=request.inches)
+
+    events: list[str] = []
+
+    class SlowOnEnd:
+        async def on_start(self, ctx) -> None:  # noqa: ARG002
+            return None
+
+        async def on_end(self, _token, _ctx, error: Exception | None) -> None:
+            events.append(f"on_end {error}")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("on_end cancelled")
+
+    class SetServerTimeout(Transport):
+        def __init__(self, transport: Transport) -> None:
+            self._transport = transport
+
+        async def execute(self, request: Request) -> Response:
+            if protocol == ProtocolType.CONNECT:
+                request.headers["connect-timeout-ms"] = "50"
+            else:
+                request.headers["grpc-timeout"] = "50m"
+            return await self._transport.execute(request)
+
+    app = HaberdasherASGIApplication(QuickHaberdasher(), interceptors=(SlowOnEnd(),))
+    transport = ASGITransport(app)
+
+    async def call() -> None:
+        match method:
+            case "unary":
+                await client.make_hat(request=Size(inches=10))
+            case "client_stream":
+                await client.make_flexible_hat(_sizes())
+            case "server_stream":
+                async for _ in client.make_similar_hats(request=Size(inches=10)):
+                    pass
+
+    async with HaberdasherClient(
+        "http://localhost",
+        protocol=protocol,
+        http_client=Client(SetServerTimeout(transport)),
+    ) as client:
+        with pytest.raises(ConnectError) as exc_info:
+            await asyncio.wait_for(call(), 5)
+
+    assert exc_info.value.code == Code.DEADLINE_EXCEEDED
+    assert exc_info.value.message == "Request timed out"
+    assert events == ["on_end None", "on_end cancelled"]
+    assert transport.app_exception is None
+
+
+@pytest.mark.asyncio
+async def test_async_server_timeout_writing_unary_response() -> None:
+    """A unary response the client doesn't read is abandoned at the deadline.
+
+    Nothing more can be sent, so the timeout is left to the server like any
+    error escaping the application.
+    """
+    errors: list[Exception | None] = []
+
+    class QuickHaberdasher(Haberdasher):
+        async def make_hat(self, request, _ctx) -> Hat:
+            return Hat(size=request.inches)
+
+    class Recorder:
+        async def on_start(self, ctx) -> None:  # noqa: ARG002
+            return None
+
+        async def on_end(self, _token, _ctx, error: Exception | None) -> None:
+            errors.append(error)
+
+    app = HaberdasherASGIApplication(QuickHaberdasher(), interceptors=(Recorder(),))
+    sent: list[str] = []
+
+    async def receive() -> HTTPRequestEvent:
+        return {
+            "type": "http.request",
+            "body": Size(inches=10).to_binary(),
+            "more_body": False,
+        }
+
+    async def send(message) -> None:
+        sent.append(message["type"])
+        if message["type"] == "http.response.body":
+            # The client isn't reading, so the server never drains the body.
+            await asyncio.Event().wait()
+
+    scope: HTTPScope = {
+        "type": "http",
+        "asgi": {"spec_version": "2.0", "version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/connectrpc.example.Haberdasher/MakeHat",
+        "raw_path": b"/connectrpc.example.Haberdasher/MakeHat",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"content-type", b"application/proto"),
+            (b"connect-timeout-ms", b"50"),
+        ],
+        "client": None,
+        "server": None,
+        "extensions": None,
+    }
+
+    task = asyncio.create_task(app(scope, receive, send))
+    done, _ = await asyncio.wait({task}, timeout=2)
+    if not done:
+        task.cancel()
+        pytest.fail("the response write was not abandoned at the deadline")
+    with pytest.raises(ConnectError) as exc_info:
+        task.result()
+    assert exc_info.value.code == Code.DEADLINE_EXCEEDED
+
+    assert sent == ["http.response.start", "http.response.body"]
+    assert errors == [None]
+
+
+@pytest.mark.asyncio
+async def test_async_unary_response_written_after_deadline() -> None:
+    """A handler that finishes late without suspending still gets its reply out.
+
+    The deadline is enforced where a write would wait, not by refusing to
+    write, as in grpc-go.
+    """
+
+    class SlowSyncHaberdasher(Haberdasher):
+        async def make_hat(self, request, _ctx) -> Hat:
+            time.sleep(0.1)  # noqa: ASYNC251 # sync work that outlasts the deadline
+            return Hat(size=request.inches)
+
+    class SetServerTimeout(Transport):
+        def __init__(self, transport: Transport) -> None:
+            self._transport = transport
+
+        async def execute(self, request: Request) -> Response:
+            request.headers["connect-timeout-ms"] = "50"
+            return await self._transport.execute(request)
+
+    transport = ASGITransport(HaberdasherASGIApplication(SlowSyncHaberdasher()))
+    async with HaberdasherClient(
+        "http://localhost", http_client=Client(SetServerTimeout(transport))
+    ) as client:
+        assert await client.make_hat(request=Size(inches=10)) == Hat(size=10)
+    assert transport.app_exception is None
+
+
+async def _sizes() -> AsyncIterator[Size]:
+    yield Size(inches=10)
 
 
 @pytest.mark.asyncio
