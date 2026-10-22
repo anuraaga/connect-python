@@ -5,7 +5,7 @@ import base64
 import json
 import random
 import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pyqwest import Client, SyncClient
@@ -865,7 +865,7 @@ async def test_client_disconnects_as_deadline_fires() -> None:
     # Give the loop the clock of Windows before Python 3.13, which advances in
     # steps of about 16ms: the deadline then fires while the clock still reads
     # before it, so the outcome can't be decided by reading the clock.
-    loop = asyncio.get_running_loop()
+    loop: Any = asyncio.get_running_loop()
     resolution = loop._clock_resolution = 0.0156
     real_time = loop.time
     loop.time = lambda: real_time() // resolution * resolution
