@@ -812,6 +812,67 @@ async def test_client_disconnect_cancels_blocked_handler(
 
 
 @pytest.mark.asyncio
+async def test_client_disconnects_as_deadline_fires() -> None:
+    """A disconnect noticed while the deadline's cancellation is in flight is harmless.
+
+    The client's own deadline is the same as the server's, so it typically
+    disconnects at the same moment the server's deadline fires.
+    """
+    events: list[str] = []
+    cancelled = asyncio.Event()
+
+    class BlockedHaberdasher(Haberdasher):
+        async def make_similar_hats(self, request, _ctx):
+            try:
+                yield Hat(size=request.inches)
+                await asyncio.Event().wait()
+            finally:
+                events.append("handler cleaned up")
+                cancelled.set()
+                # Let the watch report the disconnect before the scope exits.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+    class Recorder:
+        async def on_start(self, ctx):
+            pass
+
+        async def on_end(self, _token, _ctx, error):
+            code = error.code.value if isinstance(error, ConnectError) else error
+            events.append(f"on_end {code}")
+
+    app = HaberdasherASGIApplication(BlockedHaberdasher(), interceptors=[Recorder()])
+    request_bytes = Size(inches=10).to_binary()
+    request_body = struct.pack(">BI", 0, len(request_bytes)) + request_bytes
+    sent_request = False
+    sent: list[bytes] = []
+
+    async def receive() -> HTTPRequestEvent | HTTPDisconnectEvent:
+        nonlocal sent_request
+        if not sent_request:
+            sent_request = True
+            return {"type": "http.request", "body": request_body, "more_body": False}
+        await cancelled.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            sent.append(message["body"])
+
+    scope = _make_similar_hats_scope()
+    scope["headers"] = [*scope["headers"], (b"connect-timeout-ms", b"20")]
+
+    await asyncio.wait_for(app(scope, receive, send), timeout=1.0)
+
+    assert events == ["handler cleaned up", "on_end deadline_exceeded"]
+    end = sent[-1]
+    assert end[0] & 0b10, "last body is the end-of-stream message"
+    assert json.loads(end[5:]) == {
+        "error": {"code": "deadline_exceeded", "message": "Request timed out"}
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unary", [False, True], ids=["stream", "unary"])
 async def test_failed_send_ends_response(unary: bool) -> None:
     """A send the server rejects is raised to it, with nothing sent after it.
