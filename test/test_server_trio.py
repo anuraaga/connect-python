@@ -8,10 +8,10 @@ when it shuts down with the request in flight.
 
 from __future__ import annotations
 
-import contextlib
 import gc
 import gzip
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -19,6 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import pytest
 
@@ -433,9 +434,7 @@ def test_disconnect_ends_stream(
     ]
 
 
-def test_disconnect_cancels_blocked_unary(
-    url: str, wrapper: Wrapper, executor: ThreadPoolExecutor
-) -> None:
+def test_disconnect_cancels_blocked_unary(url: str, wrapper: Wrapper) -> None:
     """A unary handler has nothing to poll, so a disconnect cancels it like a deadline."""
     events: list[str] = []
     blocked = threading.Event()
@@ -443,14 +442,18 @@ def test_disconnect_cancels_blocked_unary(
         BlockedHats(blocked, events, in_nursery=False), interceptors=[Recorder(events)]
     )
 
-    # The client's own connection, so that closing it disconnects the request.
-    transport = SyncHTTPTransport(http_version=HTTPVersion.HTTP1)
-    client = HaberdasherClientSync(url, http_client=SyncClient(transport))
-    response = executor.submit(client.make_hat, Size(inches=10))
-    assert blocked.wait(10)
-    transport.close()
-    with contextlib.suppress(Exception):
-        response.result(10)
+    # A raw connection, so that closing it disconnects the request mid-call.
+    parsed = urlparse(url)
+    body = Size(inches=10).to_binary()
+    request = (
+        f"POST /connectrpc.example.Haberdasher/MakeHat HTTP/1.1\r\n"
+        f"Host: {parsed.netloc}\r\n"
+        "Content-Type: application/proto\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    with socket.create_connection((parsed.hostname, parsed.port)) as connection:
+        connection.sendall(request)
+        assert blocked.wait(10)
 
     assert wrapper.done.wait(10)
     assert wrapper.raised is None
