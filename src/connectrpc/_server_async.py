@@ -510,11 +510,14 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             if error is None:
                 error = _timeout_error(timeout, receiver, deadline, e)
         except BaseException as e:
+            # Save the error for sending to the client, then let it reach the
+            # app server.
             if loop.is_cancellation(e):
-                # Save the error for sending to the client, then let the cancellation reach the
-                # app server.
                 error = ConnectError(Code.CANCELED, "Request was cancelled")
                 cancelled = True
+            else:
+                error = ConnectError(Code.UNKNOWN, "Request was interrupted")
+                error.__cause__ = e
             raise
         finally:
             try:

@@ -622,6 +622,12 @@ class _ErrorRecordingInterceptor:
         await asyncio.sleep(0)
         self.errors.append(error)
 
+    def on_start_sync(self, ctx) -> None:  # noqa: ARG002
+        return None
+
+    def on_end_sync(self, _token, _ctx, error: Exception | None) -> None:
+        self.errors.append(error)
+
 
 async def _blocking_sizes() -> AsyncIterator[Size]:
     yield Size(inches=10)
@@ -916,26 +922,41 @@ async def test_async_server_cancelled(protocol: ProtocolType, method: str) -> No
     assert isinstance(outer_exceptions[0], asyncio.CancelledError)
 
 
+def _assert_on_end_error(error: Exception | None, app_exception: BaseException) -> None:
+    """Assert that on_end received the handler's exception, or an UNKNOWN error
+    caused by it if it is not an Exception."""
+    if isinstance(app_exception, Exception):
+        assert error is app_exception
+    else:
+        assert isinstance(error, ConnectError)
+        assert error.code == Code.UNKNOWN
+        assert error.message == "Request was interrupted"
+        assert error.__cause__ is app_exception
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("returns_none", "exception_type", "message"),
+    ("exception", "message"),
     [
-        pytest.param(False, TypeError, "Something went wrong", id="raises"),
+        pytest.param(TypeError, "Something went wrong", id="raises"),
         # The response fails to encode after the handler returns.
-        pytest.param(True, Exception, None, id="returns_none"),
+        pytest.param(None, None, id="returns_none"),
+        pytest.param(SystemExit, "Request was interrupted", id="exits"),
     ],
 )
 async def test_async_unhandled_exception_reraised(
-    returns_none: bool, exception_type: type[Exception], message: str | None
+    exception: type[BaseException] | None, message: str | None
 ) -> None:
     class RaisingHaberdasher(Haberdasher):
         async def make_hat(self, _request, _ctx) -> Hat:
-            if returns_none:
+            if exception is None:
                 return None  # ty: ignore[invalid-return-type]
             msg = "Something went wrong"
-            raise TypeError(msg)
+            raise exception(msg)
 
-    app = HaberdasherASGIApplication(RaisingHaberdasher())
+    interceptor = _ErrorRecordingInterceptor()
+    app = HaberdasherASGIApplication(RaisingHaberdasher(), interceptors=(interceptor,))
+    app_exceptions: list[BaseException] = []
     sent: list[str] = []
 
     async def recording_app(scope, receive, send) -> None:
@@ -943,13 +964,16 @@ async def test_async_unhandled_exception_reraised(
             sent.append(message["type"])
             await send(message)
 
-        await app(scope, receive, recording_send)
-
-    transport = ASGITransport(recording_app)
-    http_client = Client(transport)
+        # Record instead of raising, since a SystemExit would escape ASGITransport.
+        try:
+            await app(scope, receive, recording_send)
+        except BaseException as e:  # noqa: BLE001
+            app_exceptions.append(e)
 
     async with HaberdasherClient(
-        "http://localhost", timeout_ms=200, http_client=http_client
+        "http://localhost",
+        timeout_ms=200,
+        http_client=Client(ASGITransport(recording_app)),
     ) as client:
         with pytest.raises(ConnectError, match=message) as exc_info:
             await client.make_hat(request=Size(inches=10))
@@ -957,7 +981,14 @@ async def test_async_unhandled_exception_reraised(
     assert exc_info.value.code == Code.UNKNOWN
     # The application writes the Connect error itself before re-raising.
     assert "http.response.start" in sent
-    assert isinstance(transport.app_exception, exception_type)
+    assert len(app_exceptions) == 1
+    assert isinstance(app_exceptions[0], exception or Exception)
+    if exception is None:
+        # The run ended, successfully, before the response failed to encode.
+        assert interceptor.errors == [None]
+    else:
+        assert len(interceptor.errors) == 1
+        _assert_on_end_error(interceptor.errors[0], app_exceptions[0])
 
 
 @pytest.mark.asyncio
@@ -1005,25 +1036,47 @@ async def test_async_handler_timeout_error_reraised(
 
 
 @pytest.mark.asyncio
-async def test_async_unhandled_exception_reraised_stream() -> None:
+@pytest.mark.parametrize("protocol", _protocols)
+@pytest.mark.parametrize(
+    ("exception", "message"),
+    [(TypeError, "Something went wrong"), (SystemExit, "Request was interrupted")],
+)
+async def test_async_unhandled_exception_reraised_stream(
+    protocol: ProtocolType, exception: type[BaseException], message: str
+) -> None:
     class RaisingHaberdasher(Haberdasher):
         def make_similar_hats(self, _request: Size, _ctx: RequestContext) -> NoReturn:
             msg = "Something went wrong"
-            raise TypeError(msg)
+            raise exception(msg)
 
-    app = HaberdasherASGIApplication(RaisingHaberdasher())
-    transport = ASGITransport(app)
-    http_client = Client(transport)
+    interceptor = _ErrorRecordingInterceptor()
+    app = HaberdasherASGIApplication(RaisingHaberdasher(), interceptors=(interceptor,))
+    app_exceptions: list[BaseException] = []
+
+    async def recording_app(scope, receive, send) -> None:
+        # Record instead of raising, since a SystemExit would escape ASGITransport.
+        try:
+            await app(scope, receive, send)
+        except BaseException as e:  # noqa: BLE001
+            app_exceptions.append(e)
 
     async with HaberdasherClient(
-        "http://localhost", timeout_ms=200, http_client=http_client
+        "http://localhost",
+        protocol=protocol,
+        timeout_ms=200,
+        http_client=Client(ASGITransport(recording_app)),
     ) as client:
-        with pytest.raises(ConnectError, match="Something went wrong"):
+        with pytest.raises(ConnectError) as exc_info:
             async for _ in client.make_similar_hats(request=Size(inches=10)):
                 pass
 
-    assert isinstance(transport.app_exception, TypeError)
-    assert str(transport.app_exception) == "Something went wrong"
+    assert exc_info.value.code == Code.UNKNOWN
+    assert exc_info.value.message == message
+    assert len(app_exceptions) == 1
+    assert isinstance(app_exceptions[0], exception)
+    assert str(app_exceptions[0]) == "Something went wrong"
+    assert len(interceptor.errors) == 1
+    _assert_on_end_error(interceptor.errors[0], app_exceptions[0])
 
 
 @pytest.mark.asyncio
@@ -1106,6 +1159,51 @@ def test_sync_unhandled_exception_logged() -> None:
     assert "Exception in WSGI application" in logged_error
     assert "TypeError: Something went wrong" in logged_error
     assert "Traceback" in logged_error
+
+
+@pytest.mark.parametrize("method", ["unary", "server_stream", "server_stream_mid"])
+def test_sync_base_exception_reraised(method: str) -> None:
+    class RaisingHaberdasher(HaberdasherSync):
+        def make_hat(self, _request, _ctx) -> NoReturn:
+            msg = "Something went wrong"
+            raise SystemExit(msg)
+
+        def make_similar_hats(self, _request, _ctx) -> Iterator[Hat]:
+            if method == "server_stream_mid":
+                yield Hat()
+            msg = "Something went wrong"
+            raise SystemExit(msg)
+
+    interceptor = _ErrorRecordingInterceptor()
+    app = HaberdasherWSGIApplication(RaisingHaberdasher(), interceptors=(interceptor,))
+    app_exceptions: list[BaseException] = []
+
+    def recording_app(environ, start_response) -> Iterator[bytes]:
+        # Record instead of raising, since a SystemExit would escape WSGITransport.
+        try:
+            yield from app(environ, start_response)
+        except BaseException as e:  # noqa: BLE001
+            app_exceptions.append(e)
+
+    with (
+        HaberdasherClientSync(
+            "http://localhost",
+            timeout_ms=200,
+            http_client=SyncClient(WSGITransport(recording_app)),
+        ) as client,
+        pytest.raises(ConnectError),
+    ):
+        if method == "unary":
+            client.make_hat(request=Size(inches=10))
+        else:
+            for _ in client.make_similar_hats(request=Size(inches=10)):
+                pass
+
+    assert len(app_exceptions) == 1
+    assert isinstance(app_exceptions[0], SystemExit)
+    assert str(app_exceptions[0]) == "Something went wrong"
+    assert len(interceptor.errors) == 1
+    _assert_on_end_error(interceptor.errors[0], app_exceptions[0])
 
 
 def test_sync_unhandled_exception_logged_stream() -> None:
