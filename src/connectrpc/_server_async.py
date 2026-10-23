@@ -501,9 +501,14 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     error = await metadata_run.end(error)
                 if error is None and unary is not None:
                     assert ctx is not None  # noqa: S101 # set before unary
-                    await unary.send(sender, response_data, ctx)
+                    try:
+                        await unary.send(sender, response_data, ctx)
+                    except Exception as e:  # noqa: BLE001 # encoding the handler's response
+                        error = e
         except TimeoutError as e:
-            error = _timeout_error(timeout, receiver, deadline, e)
+            # A timeout while on_end runs after an error leaves that error.
+            if error is None:
+                error = _timeout_error(timeout, receiver, deadline, e)
         except BaseException as e:
             if loop.is_cancellation(e):
                 # Save the error for sending to the client, then let the cancellation reach the
@@ -563,7 +568,8 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             receive.body_done.set()
         else:
             request = await self._read_post_request(endpoint, receive, codec, headers)
-        async with loop.watch_for_disconnect(receive, scope):
+        # There is nothing here to poll a flag, so the watch must cancel.
+        async with loop.watch_for_disconnect(receive, scope, cancel=True):
             return await endpoint.function(request, ctx)
 
     async def _read_get_request(
@@ -828,7 +834,11 @@ class AsyncioLoop:
 
     @contextlib.asynccontextmanager
     async def watch_for_disconnect(
-        self, receive: _RequestReceiver, scope: Timeout | TrioTimeout
+        self,
+        receive: _RequestReceiver,
+        scope: Timeout | TrioTimeout,
+        *,
+        cancel: bool = False,  # noqa: ARG002 # asyncio always cancels
     ) -> AsyncGenerator[None]:
         """Cut the request's deadline short when the client disconnects.
 

@@ -63,12 +63,18 @@ class TrioLoop:
 
     @contextlib.asynccontextmanager
     async def watch_for_disconnect(
-        self, receive: _RequestReceiver, _scope: Timeout | TrioTimeout
+        self,
+        receive: _RequestReceiver,
+        scope: Timeout | TrioTimeout,
+        *,
+        cancel: bool = False,
     ) -> AsyncGenerator[Callable[[], bool]]:
-        # The watch yields a flag for the body to poll instead of cutting the
-        # deadline short: trio raises Cancelled at every checkpoint of a
-        # cancelled scope, which would cut short a handler's unshielded async
-        # cleanup, while a poll closes the handler's generator normally.
+        # Unless asked to cancel, the watch yields a flag for the body to poll
+        # instead of cutting the deadline short: trio raises Cancelled at every
+        # checkpoint of a cancelled scope, which would cut short a handler's
+        # unshielded async cleanup, while a poll closes the handler's generator
+        # normally. A unary handler has nothing to poll the flag, and is cut
+        # short as the deadline would.
         async def watch() -> None:
             await receive.body_done.wait()
             # An error raised in a nursery cancels the rest of it, so an error
@@ -76,6 +82,8 @@ class TrioLoop:
             with contextlib.suppress(Exception):
                 while not receive.disconnected:
                     await receive()
+            if cancel and receive.disconnected:
+                scope.reschedule(trio.current_time())
 
         def disconnected() -> bool:
             return receive.disconnected

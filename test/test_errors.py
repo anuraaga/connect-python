@@ -647,22 +647,56 @@ _protocols = [ProtocolType.CONNECT, ProtocolType.GRPC, ProtocolType.GRPC_WEB]
 _blocking_methods = ["unary", "client_stream", "server_stream"]
 
 
+class _ServerTimeoutTransport(Transport):
+    """Gives each request a 50ms timeout, so that only the server enforces one."""
+
+    def __init__(self, transport: Transport, protocol: ProtocolType) -> None:
+        self._transport = transport
+        self._protocol = protocol
+
+    async def execute(self, request: Request) -> Response:
+        if self._protocol == ProtocolType.CONNECT:
+            request.headers["connect-timeout-ms"] = "50"
+        else:
+            request.headers["grpc-timeout"] = "50m"
+        return await self._transport.execute(request)
+
+
+class _QuickHaberdasher(Haberdasher):
+    async def make_hat(self, request, _ctx) -> Hat:
+        return Hat(size=request.inches)
+
+    async def make_flexible_hat(self, request, _ctx) -> Hat:
+        async for _ in request:
+            pass
+        return Hat()
+
+    async def make_similar_hats(self, request, _ctx) -> AsyncIterator[Hat]:
+        yield Hat(size=request.inches)
+
+
+class _SlowOnEnd:
+    """An on_end that blocks until it is cancelled, recording both."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    async def on_start(self, ctx) -> None:  # noqa: ARG002
+        return None
+
+    async def on_end(self, _token, _ctx, error: Exception | None) -> None:
+        code = error.code.value if isinstance(error, ConnectError) else error
+        self.events.append(f"on_end {code}")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.events.append("on_end cancelled")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protocol", _protocols)
 @pytest.mark.parametrize("method", _blocking_methods)
 async def test_async_server_timeout(protocol: ProtocolType, method: str) -> None:
-    class SetServerTimeout(Transport):
-        def __init__(self, transport: Transport) -> None:
-            self._transport = transport
-
-        async def execute(self, request: Request) -> Response:
-            # The client sends no timeout so that only the server enforces one.
-            if protocol == ProtocolType.CONNECT:
-                request.headers["connect-timeout-ms"] = "50"
-            else:
-                request.headers["grpc-timeout"] = "50m"
-            return await self._transport.execute(request)
-
     interceptor = _ErrorRecordingInterceptor()
     app = HaberdasherASGIApplication(
         _BlockingHaberdasher(), interceptors=(interceptor,)
@@ -672,7 +706,7 @@ async def test_async_server_timeout(protocol: ProtocolType, method: str) -> None
     async with HaberdasherClient(
         "http://localhost",
         protocol=protocol,
-        http_client=Client(SetServerTimeout(transport)),
+        http_client=Client(_ServerTimeoutTransport(transport, protocol)),
     ) as client:
         with pytest.raises(ConnectError) as exc_info:
             await _call_blocking(client, method)
@@ -692,44 +726,8 @@ async def test_async_server_timeout_in_on_end(
     protocol: ProtocolType, method: str
 ) -> None:
     """A slow on_end is bounded by the request's deadline like the handler is."""
-
-    class QuickHaberdasher(Haberdasher):
-        async def make_hat(self, request, _ctx) -> Hat:
-            return Hat(size=request.inches)
-
-        async def make_flexible_hat(self, request, _ctx) -> Hat:
-            async for _ in request:
-                pass
-            return Hat()
-
-        async def make_similar_hats(self, request, _ctx) -> AsyncIterator[Hat]:
-            yield Hat(size=request.inches)
-
-    events: list[str] = []
-
-    class SlowOnEnd:
-        async def on_start(self, ctx) -> None:  # noqa: ARG002
-            return None
-
-        async def on_end(self, _token, _ctx, error: Exception | None) -> None:
-            events.append(f"on_end {error}")
-            try:
-                await asyncio.Event().wait()
-            finally:
-                events.append("on_end cancelled")
-
-    class SetServerTimeout(Transport):
-        def __init__(self, transport: Transport) -> None:
-            self._transport = transport
-
-        async def execute(self, request: Request) -> Response:
-            if protocol == ProtocolType.CONNECT:
-                request.headers["connect-timeout-ms"] = "50"
-            else:
-                request.headers["grpc-timeout"] = "50m"
-            return await self._transport.execute(request)
-
-    app = HaberdasherASGIApplication(QuickHaberdasher(), interceptors=(SlowOnEnd(),))
+    on_end = _SlowOnEnd()
+    app = HaberdasherASGIApplication(_QuickHaberdasher(), interceptors=(on_end,))
     transport = ASGITransport(app)
 
     async def call() -> None:
@@ -745,14 +743,43 @@ async def test_async_server_timeout_in_on_end(
     async with HaberdasherClient(
         "http://localhost",
         protocol=protocol,
-        http_client=Client(SetServerTimeout(transport)),
+        http_client=Client(_ServerTimeoutTransport(transport, protocol)),
     ) as client:
         with pytest.raises(ConnectError) as exc_info:
             await asyncio.wait_for(call(), 5)
 
     assert exc_info.value.code == Code.DEADLINE_EXCEEDED
     assert exc_info.value.message == "Request timed out"
-    assert events == ["on_end None", "on_end cancelled"]
+    assert on_end.events == ["on_end None", "on_end cancelled"]
+    assert transport.app_exception is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _protocols)
+async def test_async_server_timeout_in_on_end_keeps_handler_error(
+    protocol: ProtocolType,
+) -> None:
+    """A timeout that cuts on_end short after the handler failed keeps that failure."""
+
+    class FailingHaberdasher(Haberdasher):
+        async def make_hat(self, _request, _ctx) -> NoReturn:
+            raise ConnectError(Code.NOT_FOUND, "no such hat")
+
+    on_end = _SlowOnEnd()
+    transport = ASGITransport(
+        HaberdasherASGIApplication(FailingHaberdasher(), interceptors=(on_end,))
+    )
+    async with HaberdasherClient(
+        "http://localhost",
+        protocol=protocol,
+        http_client=Client(_ServerTimeoutTransport(transport, protocol)),
+    ) as client:
+        with pytest.raises(ConnectError) as exc_info:
+            await asyncio.wait_for(client.make_hat(request=Size(inches=10)), 5)
+
+    assert exc_info.value.code == Code.NOT_FOUND
+    assert exc_info.value.message == "no such hat"
+    assert on_end.events == ["on_end not_found", "on_end cancelled"]
     assert transport.app_exception is None
 
 
@@ -765,10 +792,6 @@ async def test_async_server_timeout_writing_unary_response() -> None:
     """
     errors: list[Exception | None] = []
 
-    class QuickHaberdasher(Haberdasher):
-        async def make_hat(self, request, _ctx) -> Hat:
-            return Hat(size=request.inches)
-
     class Recorder:
         async def on_start(self, ctx) -> None:  # noqa: ARG002
             return None
@@ -776,7 +799,7 @@ async def test_async_server_timeout_writing_unary_response() -> None:
         async def on_end(self, _token, _ctx, error: Exception | None) -> None:
             errors.append(error)
 
-    app = HaberdasherASGIApplication(QuickHaberdasher(), interceptors=(Recorder(),))
+    app = HaberdasherASGIApplication(_QuickHaberdasher(), interceptors=(Recorder(),))
     sent: list[str] = []
 
     async def receive() -> HTTPRequestEvent:
@@ -837,17 +860,10 @@ async def test_async_unary_response_written_after_deadline() -> None:
             time.sleep(0.1)  # noqa: ASYNC251 # sync work that outlasts the deadline
             return Hat(size=request.inches)
 
-    class SetServerTimeout(Transport):
-        def __init__(self, transport: Transport) -> None:
-            self._transport = transport
-
-        async def execute(self, request: Request) -> Response:
-            request.headers["connect-timeout-ms"] = "50"
-            return await self._transport.execute(request)
-
     transport = ASGITransport(HaberdasherASGIApplication(SlowSyncHaberdasher()))
     async with HaberdasherClient(
-        "http://localhost", http_client=Client(SetServerTimeout(transport))
+        "http://localhost",
+        http_client=Client(_ServerTimeoutTransport(transport, ProtocolType.CONNECT)),
     ) as client:
         assert await client.make_hat(request=Size(inches=10)) == Hat(size=10)
     assert transport.app_exception is None
@@ -901,24 +917,47 @@ async def test_async_server_cancelled(protocol: ProtocolType, method: str) -> No
 
 
 @pytest.mark.asyncio
-async def test_async_unhandled_exception_reraised() -> None:
+@pytest.mark.parametrize(
+    ("returns_none", "exception_type", "message"),
+    [
+        pytest.param(False, TypeError, "Something went wrong", id="raises"),
+        # The response fails to encode after the handler returns.
+        pytest.param(True, Exception, None, id="returns_none"),
+    ],
+)
+async def test_async_unhandled_exception_reraised(
+    returns_none: bool, exception_type: type[Exception], message: str | None
+) -> None:
     class RaisingHaberdasher(Haberdasher):
-        async def make_hat(self, _request, _ctx) -> NoReturn:
+        async def make_hat(self, _request, _ctx) -> Hat:
+            if returns_none:
+                return None  # ty: ignore[invalid-return-type]
             msg = "Something went wrong"
             raise TypeError(msg)
 
     app = HaberdasherASGIApplication(RaisingHaberdasher())
-    transport = ASGITransport(app)
+    sent: list[str] = []
+
+    async def recording_app(scope, receive, send) -> None:
+        async def recording_send(message) -> None:
+            sent.append(message["type"])
+            await send(message)
+
+        await app(scope, receive, recording_send)
+
+    transport = ASGITransport(recording_app)
     http_client = Client(transport)
 
     async with HaberdasherClient(
         "http://localhost", timeout_ms=200, http_client=http_client
     ) as client:
-        with pytest.raises(ConnectError, match="Something went wrong"):
+        with pytest.raises(ConnectError, match=message) as exc_info:
             await client.make_hat(request=Size(inches=10))
 
-    assert isinstance(transport.app_exception, TypeError)
-    assert str(transport.app_exception) == "Something went wrong"
+    assert exc_info.value.code == Code.UNKNOWN
+    # The application writes the Connect error itself before re-raising.
+    assert "http.response.start" in sent
+    assert isinstance(transport.app_exception, exception_type)
 
 
 @pytest.mark.asyncio

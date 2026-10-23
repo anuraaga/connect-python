@@ -8,6 +8,7 @@ when it shuts down with the request in flight.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import gzip
 import json
@@ -430,6 +431,35 @@ def test_disconnect_ends_stream(
         f"on_end started {end_error['code']}",
         "on_end finished",
     ]
+
+
+def test_disconnect_cancels_blocked_unary(
+    url: str, wrapper: Wrapper, executor: ThreadPoolExecutor
+) -> None:
+    """A unary handler has nothing to poll, so a disconnect cancels it like a deadline."""
+    events: list[str] = []
+    blocked = threading.Event()
+    wrapper.app = HaberdasherASGIApplication(
+        BlockedHats(blocked, events, in_nursery=False), interceptors=[Recorder(events)]
+    )
+
+    # The client's own connection, so that closing it disconnects the request.
+    transport = SyncHTTPTransport(http_version=HTTPVersion.HTTP1)
+    client = HaberdasherClientSync(url, http_client=SyncClient(transport))
+    response = executor.submit(client.make_hat, Size(inches=10))
+    assert blocked.wait(10)
+    transport.close()
+    with contextlib.suppress(Exception):
+        response.result(10)
+
+    assert wrapper.done.wait(10)
+    assert wrapper.raised is None
+    assert events == [
+        "handler cleaned up",
+        "on_end started canceled",
+        "on_end finished",
+    ]
+    assert wrapper.error() == {"code": "canceled", "message": "Client disconnected"}
 
 
 class ScopedHats(Haberdasher):
