@@ -5,7 +5,7 @@ import pytest
 from connectrpc._protocol_grpc import GRPCServerProtocol, _parse_timeout
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
-from connectrpc.method import IdempotencyLevel, MethodInfo
+from connectrpc.method import IdempotencyLevel, MethodInfo, StreamType
 from connectrpc.request import Headers, RequestContext
 
 _METHOD = MethodInfo(
@@ -14,6 +14,7 @@ _METHOD = MethodInfo(
     input=bytes,
     output=bytes,
     idempotency_level=IdempotencyLevel.UNKNOWN,
+    stream_type=StreamType.UNARY,
 )
 
 
