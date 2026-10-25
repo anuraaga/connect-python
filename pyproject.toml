@@ -81,7 +81,7 @@ dev = [
   "opentelemetry-sdk==1.45.1",
   "protobuf>=5.28",
   "protoc-gen-grpc-py==0.4.0",
-  "protoc-gen-py==0.6.0",
+  "protoc-gen-py==0.7.0",
 ]
 
 docs = ["mkdocstrings-python==2.0.9", "zensical==0.0.71"]
