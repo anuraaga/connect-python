@@ -1,6 +1,6 @@
 [project]
 name = "connectrpc"
-version = "0.12.1"
+version = "0.13.0"
 description = "Server and client runtime library for Connect RPC"
 readme = "README.md"
 requires-python = ">= 3.11"
@@ -82,7 +82,7 @@ dev = [
   "opentelemetry-sdk==1.45.1",
   "protobuf>=5.28",
   "protoc-gen-grpc-py==0.4.0",
-  "protoc-gen-py==0.6.0",
+  "protoc-gen-py==0.7.0",
 ]
 
 docs = ["mkdocstrings-python==2.0.9", "zensical==0.0.71"]
